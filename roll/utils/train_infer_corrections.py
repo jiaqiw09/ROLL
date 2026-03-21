@@ -235,7 +235,7 @@ def apply_train_infer_correction_to_batch(
     )
 
     # Set train_infer_is_weight
-    batch.batch["train_infer_is_weight"] = is_w
+    batch.batch["train_infer_is_weight"] = is_w.to(infer_lp.dtype)
 
     # Apply filter mask to all specified masks
     for key in update_mask_keys:

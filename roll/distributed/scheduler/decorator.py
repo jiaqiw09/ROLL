@@ -22,6 +22,18 @@ logger = get_logger()
 
 BIND_WORKER_METHOD_FLAG = "BIND_WORKER_METHOD_FLAG"
 
+_TQ_AVAILABLE = None
+
+def _is_tq_available():
+    global _TQ_AVAILABLE
+    if _TQ_AVAILABLE is None:
+        try:
+            from transfer_queue import BatchMeta, KVBatchMeta  # noqa: F401
+            _TQ_AVAILABLE = True
+        except ImportError:
+            _TQ_AVAILABLE = False
+    return _TQ_AVAILABLE
+
 
 class Dispatch(Enum):
     """
@@ -47,6 +59,20 @@ def _split_args_kwargs(chunks, *args, **kwargs):
     """
 
     def split(arg, chunks):
+        if _is_tq_available():
+            from transfer_queue import KVBatchMeta, BatchMeta
+            if isinstance(arg, KVBatchMeta):
+                print(f"[TQ] _split_args_kwargs split input: KVBatchMeta")
+                from roll.utils.transferqueue_utils import kv_batch_meta2batch_meta
+                batch_meta = kv_batch_meta2batch_meta(arg)
+                result = batch_meta.chunk(chunks=chunks)
+                print(f"[TQ] _split_args_kwargs split output: List[BatchMeta]")
+                return result
+            if isinstance(arg, BatchMeta):
+                print(f"[TQ] _split_args_kwargs split input: BatchMeta")
+                result = arg.chunk(chunks=chunks)
+                print(f"[TQ] _split_args_kwargs split output: List[BatchMeta]")
+                return result
         if isinstance(arg, list):
             return list(chunked(arg, len(arg) // chunks))
         else:
@@ -115,12 +141,13 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
 
     def get_arg_by_rank_info(arg, rank_info):
         local_dp_rank = rank_info.dp_rank
-        if (
-            _dispatch_first
-            and isinstance(arg[local_dp_rank], DataProto)
-            and not (rank_info.tp_rank == 0 and rank_info.cp_rank == 0 and rank_info.pp_rank == 0)
-        ):
-            return DataProto(batch=None, meta_info=arg[local_dp_rank].meta_info)
+        if _dispatch_first and not (rank_info.tp_rank == 0 and rank_info.cp_rank == 0 and rank_info.pp_rank == 0):
+            if isinstance(arg[local_dp_rank], DataProto):
+                return DataProto(batch=None, meta_info=arg[local_dp_rank].meta_info)
+            if _is_tq_available():
+                from transfer_queue import BatchMeta
+                if isinstance(arg[local_dp_rank], BatchMeta):
+                    return arg[local_dp_rank]
         return arg[local_dp_rank]
 
     for arg in splitted_args:
@@ -156,31 +183,54 @@ def collect_dp_mp_compute(cluster, output):
     只需要搜集tp=0, pipeline_last_stage的结果
     输入输出都是list, 是batch维度的
     """
+    print(f"[TQ] collect_dp_mp_compute input type: {type(output[0]).__name__ if output else 'empty'}")
     output_in_dp = []
     for global_rank in range(cluster.world_size):
         local_rank_info = cluster.get_rank_info(rank=global_rank)
         if local_rank_info.tp_rank == 0 and local_rank_info.is_pipeline_last_stage and local_rank_info.cp_rank == 0:
             output_in_dp.append(output[global_rank])
     if isinstance(output[0], list):
-        return list(chain.from_iterable(output_in_dp))
+        result = list(chain.from_iterable(output_in_dp))
+        print(f"[TQ] collect_dp_mp_compute output type: list")
+        return result
     elif isinstance(output[0], DataProto):
-        return DataProto.concat(output_in_dp)
+        result = DataProto.concat(output_in_dp)
+        print(f"[TQ] collect_dp_mp_compute output type: DataProto")
+        return result
+    elif _is_tq_available():
+        from transfer_queue import BatchMeta
+        if isinstance(output[0], BatchMeta):
+            merged = BatchMeta.concat(output_in_dp)
+            from roll.utils.transferqueue_utils import batch_meta2kv_batch_meta
+            result = batch_meta2kv_batch_meta(merged)
+            print(f"[TQ] collect_dp_mp_compute output type: {type(result).__name__}")
+            return result
+        if isinstance(output[0], ray.ObjectRef):
+            result = _collect_object_refs(cluster, output)
+            print(f"[TQ] collect_dp_mp_compute output type: ObjectRefWrap")
+            return result
+        raise NotImplementedError(f"output type {type(output[0])}")
     elif isinstance(output[0], ray.ObjectRef):
-        # 处理block=False情况下，dp内的可能完成时间不一致问题
-        output_in_dp = []
-        for global_rank in range(cluster.world_size):
-            local_rank_info = cluster.get_rank_info(rank=global_rank)
-            collected = False
-            if (
-                local_rank_info.tp_rank == 0
-                and local_rank_info.is_pipeline_last_stage
-                and local_rank_info.cp_rank == 0
-            ):
-                collected = True
-            output_in_dp.append(ObjectRefWrap(output[global_rank], collected=collected))
-        return output_in_dp
+        result = _collect_object_refs(cluster, output)
+        print(f"[TQ] collect_dp_mp_compute output type: ObjectRefWrap")
+        return result
     else:
         raise NotImplementedError(f"output type {type(output[0])}")
+
+
+def _collect_object_refs(cluster, output):
+    output_in_dp = []
+    for global_rank in range(cluster.world_size):
+        local_rank_info = cluster.get_rank_info(rank=global_rank)
+        collected = False
+        if (
+            local_rank_info.tp_rank == 0
+            and local_rank_info.is_pipeline_last_stage
+            and local_rank_info.cp_rank == 0
+        ):
+            collected = True
+        output_in_dp.append(ObjectRefWrap(output[global_rank], collected=collected))
+    return output_in_dp
 
 
 predefined_dispatch_mode_fn = {

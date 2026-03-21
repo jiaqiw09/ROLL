@@ -347,6 +347,13 @@ class RLVRPipeline(BasePipeline):
         for domain in self.rewards.keys():
             self.running[domain] = RunningMoments()
 
+        self.tq_enabled = getattr(self.pipeline_config, 'transfer_queue', None) is not None \
+            and self.pipeline_config.transfer_queue.enable
+        if self.tq_enabled:
+            from roll.utils.tq_pipeline_utils import init_tq
+            init_tq(self.pipeline_config.transfer_queue)
+            print(f"[TQ] RLVRPipeline.__init__: TQ enabled, initialized in pipeline driver process")
+
     @torch.no_grad()
     def save_metrics(self, batch):
         def remove_leading_zeros(A, r_mask):
@@ -506,21 +513,55 @@ class RLVRPipeline(BasePipeline):
                     actor_infer_response_timer,
                     Timer(name="step_generate", logger=None) as step_generate_timer,
                 ):
-                    domain_batches = {}
                     scheduler_refs = {}
                     for domain, scheduler in self.generate_schedulers.items():
                         scheduler_refs[domain] = scheduler.get_batch.remote(
                             data=batch, global_step=global_step, batch_size=self.domain_batch_size[domain]
                         )
-                    for domain, scheduler_ref in scheduler_refs.items():
-                        domain_batch: DataProto = ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout)
-                        metrics_mgr.add_domain_metrics(
-                            domain, reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
+
+                    kv_meta = None
+                    if self.tq_enabled:
+                        print(f"[TQ] Pipeline.run: ===== TQ GENERATE PATH =====")
+                        from roll.utils.tq_pipeline_utils import (
+                            merge_kv_batch_metas, kv_batch_meta_to_dataproto,
+                            fmt_kv_meta, fmt_dataproto,
                         )
-                        domain_batches[domain] = domain_batch
-                    generate_output = DataProto.concat([domain_batch for domain_batch in domain_batches.values()])
+                        domain_kv_metas = {}
+                        for domain, scheduler_ref in scheduler_refs.items():
+                            domain_kv_meta = ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout)
+                            domain_metrics = domain_kv_meta.extra_info.pop("metrics", {})
+                            metrics_mgr.add_domain_metrics(domain, reduce_metrics(domain_metrics))
+                            domain_kv_metas[domain] = domain_kv_meta
+                            print(f"[TQ] Pipeline.run: received from domain='{domain}':\n"
+                                  f"  {fmt_kv_meta(domain_kv_meta)}")
+                        kv_meta = merge_kv_batch_metas(list(domain_kv_metas.values()))
+
+                        scheduler_non_tensor = {}
+                        for dkv in domain_kv_metas.values():
+                            ntb = (dkv.extra_info or {}).get("non_tensor_batch", {})
+                            for k, v in ntb.items():
+                                scheduler_non_tensor.setdefault(k, []).extend(v)
+
+                        print(f"[TQ] Pipeline.run: reading full batch from TQ for local computation...")
+                        batch = kv_batch_meta_to_dataproto(kv_meta)
+                        for k, v in scheduler_non_tensor.items():
+                            batch.non_tensor_batch[k] = np.array(v, dtype=object)
+                        generate_output = batch
+                        generate_output.meta_info.pop("is_offload_states", None)
+                        print(f"[TQ] Pipeline.run: batch reconstructed from TQ:\n"
+                              f"  {fmt_dataproto(batch)}")
+                    else:
+                        domain_batches = {}
+                        for domain, scheduler_ref in scheduler_refs.items():
+                            domain_batch: DataProto = ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout)
+                            metrics_mgr.add_domain_metrics(
+                                domain, reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
+                            )
+                            domain_batches[domain] = domain_batch
+                        generate_output = DataProto.concat([domain_batch for domain_batch in domain_batches.values()])
+                        generate_output.meta_info.pop("is_offload_states", None)
+
                     dump_rollout_to_specific_path(self.pipeline_config.rollout_dump_dir, global_step, generate_output, self.tokenizer)
-                    generate_output.meta_info.pop("is_offload_states", None)
 
                     if not self.pipeline_config.async_pipeline:
                         ray.get([scheduler.pause_sampling.remote() for scheduler in self.generate_schedulers.values()])
@@ -538,87 +579,150 @@ class RLVRPipeline(BasePipeline):
                 batch.non_tensor_batch['sample_uuid'] = np.array([str(uuid.uuid4()) for _ in range(batch.batch.shape[0])], dtype=object)
                 batch.batch["prompt_id"] = torch.arange(batch.batch.batch_size[0], device=batch.batch.device)
 
+                if self.tq_enabled:
+                    kv_meta.extra_info = batch.meta_info
+                    print(f"[TQ] Pipeline.run: synced kv_meta.extra_info = batch.meta_info\n"
+                          f"  meta_info_keys={list(batch.meta_info.keys())}")
+
                 with Timer(name="cal_ref_log_probs", logger=None) as cal_ref_log_probs_timer:
                     if self.pipeline_config.enable_reference:
-                        worker_config = self.pipeline_config.reference if self.use_ref_model else self.pipeline_config.actor_train
-                        worker = self.reference if self.use_ref_model else self.pipeline_config.actor_train
-                        if worker_config.use_dynamic_batching_in_infer:
-                            batch, dynamic_batching_metrics = dynamic_batching_shard(
-                                batch,
-                                worker.dp_size,
-                                worker_config.max_tokens_per_microbatch_in_infer,
-                                worker_config.sequence_length_round_in_infer,
-                                worker_config.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
-                                worker_config.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
-                                "reference/compute_log_probs",
-                            ) 
-                            metrics_mgr.add_metrics(dynamic_batching_metrics)
-                        if not self.use_ref_model:
-                            batch.meta_info["disable_adapter"] = True
-                            batch.meta_info["is_offload_states"] = False
-                            batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
-                            ref_log_probs = self.actor_train.compute_log_probs(batch, blocking=True)
+                        if self.tq_enabled:
+                            from roll.utils.tq_pipeline_utils import fmt_kv_meta as _fmt_kv
+                            print(f"[TQ] Pipeline.run: ===== TQ COMPUTE REF LOG PROBS =====\n"
+                                  f"  kv_meta going to worker: {_fmt_kv(kv_meta)}")
+                            from roll.utils.tq_pipeline_utils import (
+                                kv_batch_meta_to_dataproto, kv_batch_meta_put_fields,
+                            )
+                            if not self.use_ref_model:
+                                kv_meta.extra_info["disable_adapter"] = True
+                                kv_meta.extra_info["is_offload_states"] = False
+                                self.actor_train.compute_log_probs(kv_meta, blocking=True)
+                            else:
+                                self.reference.compute_log_probs(kv_meta, blocking=True)
+                            ref_fields = kv_batch_meta_to_dataproto(kv_meta, fields=["log_probs"])
+                            ref_fields.rename(old_keys="log_probs", new_keys="ref_log_probs")
+                            kv_batch_meta_put_fields(kv_meta, ref_fields, field_keys=["ref_log_probs"])
+                            batch.batch["ref_log_probs"] = ref_fields.batch["ref_log_probs"]
                         else:
-                            batch_balance(batch, dp_size=self.reference.dp_size, minibatch_size=len(batch))
-                            ref_log_probs = self.reference.compute_log_probs(batch, blocking=True)
-                        metrics_mgr.add_reduced_metrics(ref_log_probs.meta_info.pop("metrics", {}))
-                        ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
-                        batch = batch.union(ref_log_probs)
+                            worker_config = self.pipeline_config.reference if self.use_ref_model else self.pipeline_config.actor_train
+                            worker = self.reference if self.use_ref_model else self.pipeline_config.actor_train
+                            if worker_config.use_dynamic_batching_in_infer:
+                                batch, dynamic_batching_metrics = dynamic_batching_shard(
+                                    batch,
+                                    worker.dp_size,
+                                    worker_config.max_tokens_per_microbatch_in_infer,
+                                    worker_config.sequence_length_round_in_infer,
+                                    worker_config.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                                    worker_config.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                                    "reference/compute_log_probs",
+                                ) 
+                                metrics_mgr.add_metrics(dynamic_batching_metrics)
+                            if not self.use_ref_model:
+                                batch.meta_info["disable_adapter"] = True
+                                batch.meta_info["is_offload_states"] = False
+                                batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
+                                ref_log_probs = self.actor_train.compute_log_probs(batch, blocking=True)
+                            else:
+                                batch_balance(batch, dp_size=self.reference.dp_size, minibatch_size=len(batch))
+                                ref_log_probs = self.reference.compute_log_probs(batch, blocking=True)
+                            metrics_mgr.add_reduced_metrics(ref_log_probs.meta_info.pop("metrics", {}))
+                            ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
+                            batch = batch.union(ref_log_probs)
                 metrics_mgr.add_metric("time/ref_log_probs_values", cal_ref_log_probs_timer.last)
 
                 with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
-                    if self.pipeline_config.enable_reference and not self.use_ref_model:
-                        batch.meta_info["disable_adapter"] = False
-                    batch.meta_info["is_offload_states"] = False
-                    if self.pipeline_config.adv_estimator == "gae":
-                        values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
-
-                    if self.pipeline_config.enable_old_logprobs_recompute:
-                        batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
-                        if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
-                            batch, dynamic_batching_metrics = dynamic_batching_shard(
-                                batch,
-                                self.actor_train.dp_size,
-                                self.pipeline_config.actor_train.max_tokens_per_microbatch_in_infer,
-                                self.pipeline_config.actor_train.sequence_length_round_in_infer,
-                                self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
-                                self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
-                                "actor_train/compute_log_probs",
-                            )
-                            metrics_mgr.add_metrics(dynamic_batching_metrics)
-                        old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
-                        old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
-
-                        # Customize_logging metrics, Double check call twice
-                        if self.pipeline_config.save_logging_board_dir:
-                            old_log_probs_refs2: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
-                                batch, blocking=False
-                            )
-                            old_log_probs2 = DataProto.materialize_concat(data_refs=old_log_probs_refs2)
-                            batch.batch["old_log_probs2"] = old_log_probs2.batch["log_probs"]
-                            batch.batch["old_log_probs2_entropy"] = old_log_probs2.batch["entropy"]
-
-                        agg_entropy = agg_loss(
-                            loss_mat=old_log_probs.batch["entropy"],
-                            loss_mask=batch.batch["response_mask"][:, 1:],
-                            loss_agg_mode="token-mean",
+                    if self.tq_enabled:
+                        from roll.utils.tq_pipeline_utils import (
+                            kv_batch_meta_to_dataproto, kv_batch_meta_put_fields,
+                            fmt_kv_meta,
                         )
-                        batch.meta_info["agg_entropy"] = agg_entropy
+                        print(f"[TQ] Pipeline.run: ===== TQ COMPUTE OLD LOG PROBS + VALUES =====\n"
+                              f"  kv_meta: {fmt_kv_meta(kv_meta)}")
+                        if self.pipeline_config.enable_reference and not self.use_ref_model:
+                            kv_meta.extra_info["disable_adapter"] = False
+                        kv_meta.extra_info["is_offload_states"] = False
 
-                        batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
-                        metrics_mgr.add_reduced_metrics(old_log_probs.meta_info.pop("metrics", {}))
+                        if self.pipeline_config.adv_estimator == "gae":
+                            self.critic.compute_values(kv_meta, blocking=True)
+
+                        if self.pipeline_config.enable_old_logprobs_recompute:
+                            self.actor_train.compute_log_probs(kv_meta, blocking=True)
+                            old_fields = kv_batch_meta_to_dataproto(kv_meta, fields=["log_probs", "entropy"])
+                            agg_entropy = agg_loss(
+                                loss_mat=old_fields.batch["entropy"],
+                                loss_mask=batch.batch["response_mask"][:, 1:],
+                                loss_agg_mode="token-mean",
+                            )
+                            batch.meta_info["agg_entropy"] = agg_entropy
+                            batch.batch["old_log_probs"] = old_fields.batch["log_probs"]
+                            old_fields.batch["old_log_probs"] = old_fields.batch["log_probs"]
+                            kv_batch_meta_put_fields(kv_meta, old_fields, field_keys=["old_log_probs"])
+                        else:
+                            batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
+                            zero_dp = DataProto(batch=batch.batch.select("old_log_probs"))
+                            kv_batch_meta_put_fields(kv_meta, zero_dp, field_keys=["old_log_probs"])
+
+                        if self.pipeline_config.adv_estimator == "gae":
+                            values_data = kv_batch_meta_to_dataproto(kv_meta, fields=["values"])
+                            batch = batch.union(values_data)
+
+                        if not self.pipeline_config.enable_reference:
+                            batch.batch["ref_log_probs"] = batch.batch["old_log_probs"].clone()
+                            ref_dp = DataProto(batch=batch.batch.select("ref_log_probs"))
+                            kv_batch_meta_put_fields(kv_meta, ref_dp, field_keys=["ref_log_probs"])
                     else:
-                        # Use zeros when optimization is enabled
-                        batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
+                        if self.pipeline_config.enable_reference and not self.use_ref_model:
+                            batch.meta_info["disable_adapter"] = False
+                        batch.meta_info["is_offload_states"] = False
+                        if self.pipeline_config.adv_estimator == "gae":
+                            values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
 
-                    if self.pipeline_config.adv_estimator == "gae":
-                        values = DataProto.materialize_concat(data_refs=values_refs)
-                        batch = batch.union(values)
-                        metrics_mgr.add_reduced_metrics(values.meta_info.pop("metrics", {}))
+                        if self.pipeline_config.enable_old_logprobs_recompute:
+                            batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
+                            if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
+                                batch, dynamic_batching_metrics = dynamic_batching_shard(
+                                    batch,
+                                    self.actor_train.dp_size,
+                                    self.pipeline_config.actor_train.max_tokens_per_microbatch_in_infer,
+                                    self.pipeline_config.actor_train.sequence_length_round_in_infer,
+                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                                    "actor_train/compute_log_probs",
+                                )
+                                metrics_mgr.add_metrics(dynamic_batching_metrics)
+                            old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
+                            old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
 
-                    # Mock ref_log_probs using old_log_probs if reference is disabled
-                    if not self.pipeline_config.enable_reference:
-                        batch.batch["ref_log_probs"] = batch.batch["old_log_probs"].clone()
+                            # Customize_logging metrics, Double check call twice
+                            if self.pipeline_config.save_logging_board_dir:
+                                old_log_probs_refs2: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
+                                    batch, blocking=False
+                                )
+                                old_log_probs2 = DataProto.materialize_concat(data_refs=old_log_probs_refs2)
+                                batch.batch["old_log_probs2"] = old_log_probs2.batch["log_probs"]
+                                batch.batch["old_log_probs2_entropy"] = old_log_probs2.batch["entropy"]
+
+                            agg_entropy = agg_loss(
+                                loss_mat=old_log_probs.batch["entropy"],
+                                loss_mask=batch.batch["response_mask"][:, 1:],
+                                loss_agg_mode="token-mean",
+                            )
+                            batch.meta_info["agg_entropy"] = agg_entropy
+
+                            batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
+                            metrics_mgr.add_reduced_metrics(old_log_probs.meta_info.pop("metrics", {}))
+                        else:
+                            # Use zeros when optimization is enabled
+                            batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
+
+                        if self.pipeline_config.adv_estimator == "gae":
+                            values = DataProto.materialize_concat(data_refs=values_refs)
+                            batch = batch.union(values)
+                            metrics_mgr.add_reduced_metrics(values.meta_info.pop("metrics", {}))
+
+                        # Mock ref_log_probs using old_log_probs if reference is disabled
+                        if not self.pipeline_config.enable_reference:
+                            batch.batch["ref_log_probs"] = batch.batch["old_log_probs"].clone()
                 metrics_mgr.add_metric("time/old_log_probs", cal_old_logpb_timer.last)
 
                 # 要按domain group by处理reward
@@ -705,40 +809,70 @@ class RLVRPipeline(BasePipeline):
                                                                                     'loss_mask_keys'])
                     metrics_mgr.add_metrics(corr_metrics)
 
+                if self.tq_enabled:
+                    from roll.utils.tq_pipeline_utils import kv_batch_meta_put_fields, fmt_kv_meta as _fmt_kv2
+                    print(f"[TQ] Pipeline.run: ===== TQ WRITEBACK BEFORE TRAIN =====")
+                    tq_writeback_fields = ["advantages", "returns", "token_level_rewards", "final_response_mask"]
+                    tq_writeback_fields.append("train_infer_is_weight")
+                    if self.pipeline_config.enable_old_logprobs_recompute:
+                        tq_writeback_fields.extend(batch.meta_info.get("loss_mask_keys", []))
+                    existing_fields = [f for f in tq_writeback_fields if f in batch.batch.keys()]
+                    _shapes = {f: list(batch.batch[f].shape) for f in existing_fields}
+                    print(f"[TQ] Pipeline.run: writeback fields={existing_fields}\n"
+                          f"  field_shapes={_shapes}")
+                    if existing_fields:
+                        kv_batch_meta_put_fields(kv_meta, batch, field_keys=existing_fields)
+                    kv_meta.extra_info = batch.meta_info
+                    print(f"[TQ] Pipeline.run: kv_meta after writeback:\n  {_fmt_kv2(kv_meta)}")
+
                 with Timer(name="step_train", logger=None) as step_train_timer:
-                    if self.pipeline_config.adv_estimator == "gae":
-                        critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
+                    if self.tq_enabled:
+                        print(f"[TQ] Pipeline.run: ===== TQ TRAIN STEP =====\n"
+                              f"  dispatching kv_meta to critic/actor train_step")
+                        if self.pipeline_config.adv_estimator == "gae":
+                            critic_train_metrics = self.critic.train_step(kv_meta, blocking=True)
+                            if isinstance(critic_train_metrics, DataProto):
+                                metrics_mgr.add_reduced_metrics(critic_train_metrics.meta_info.pop("metrics", {}))
 
-                    with actor_train_timer:
-                        # implement critic warmup
-                        if self.pipeline_config.critic_warmup <= global_step:
-                            # Reorder data for DP rank load balancing
-                            batch_balance_metrics = batch_balance(batch, dp_size=self.actor_train.dp_size,
-                                minibatch_size=self.pipeline_config.actor_train.training_args.per_device_train_batch_size
-                                * self.pipeline_config.actor_train.training_args.gradient_accumulation_steps
-                                * self.actor_train.dp_size, logging_prefix="global_seqlen/actor_train")
-                            metrics_mgr.add_metrics(batch_balance_metrics)
-                            # update actor
-                            if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
-                                batch, dynamic_batching_metrics = dynamic_batching_shard(
-                                    batch,
-                                    self.actor_train.dp_size,
-                                    self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
-                                    self.pipeline_config.actor_train.sequence_length_round_in_train,
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
-                                    "actor_train/train_step",
+                        with actor_train_timer:
+                            if self.pipeline_config.critic_warmup <= global_step:
+                                actor_train_metrics = self.actor_train.train_step(kv_meta, blocking=True)
+                                if isinstance(actor_train_metrics, DataProto):
+                                    metrics_mgr.add_reduced_metrics(actor_train_metrics.meta_info.pop("metrics", {}))
+                    else:
+                        if self.pipeline_config.adv_estimator == "gae":
+                            critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
+
+                        with actor_train_timer:
+                            # implement critic warmup
+                            if self.pipeline_config.critic_warmup <= global_step:
+                                # Reorder data for DP rank load balancing
+                                batch_balance_metrics = batch_balance(batch, dp_size=self.actor_train.dp_size,
+                                    minibatch_size=self.pipeline_config.actor_train.training_args.per_device_train_batch_size
+                                    * self.pipeline_config.actor_train.training_args.gradient_accumulation_steps
+                                    * self.actor_train.dp_size, logging_prefix="global_seqlen/actor_train")
+                                metrics_mgr.add_metrics(batch_balance_metrics)
+                                # update actor
+                                if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
+                                    batch, dynamic_batching_metrics = dynamic_batching_shard(
+                                        batch,
+                                        self.actor_train.dp_size,
+                                        self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
+                                        self.pipeline_config.actor_train.sequence_length_round_in_train,
+                                        self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                                        self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                                        "actor_train/train_step",
+                                    )
+                                    metrics_mgr.add_metrics(dynamic_batching_metrics)
+                                actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
+                                actor_train_metrics: DataProto = DataProto.materialize_concat(
+                                    data_refs=actor_train_metrics_refs
                                 )
-                                metrics_mgr.add_metrics(dynamic_batching_metrics)
-                            actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
-                            actor_train_metrics: DataProto = DataProto.materialize_concat(
-                                data_refs=actor_train_metrics_refs
-                            )
-                            metrics_mgr.add_reduced_metrics(actor_train_metrics.meta_info.pop("metrics", {}))
+                                metrics_mgr.add_reduced_metrics(actor_train_metrics.meta_info.pop("metrics", {}))
 
-                    if self.pipeline_config.adv_estimator == "gae":
-                        critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
-                        metrics_mgr.add_reduced_metrics(critic_train_metrics.meta_info.pop("metrics", {}))
+                        if self.pipeline_config.adv_estimator == "gae":
+                            critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
+                            metrics_mgr.add_reduced_metrics(critic_train_metrics.meta_info.pop("metrics", {}))
 
                 metrics_mgr.add_metric("time/step_train", step_train_timer.last)
 

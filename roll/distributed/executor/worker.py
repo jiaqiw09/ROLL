@@ -125,6 +125,15 @@ class Worker:
     def get_rank_info(self):
         return self.rank_info
 
+    def query_collect_info(self, collect_fn) -> bool:
+        """Whether this worker should collect (write back) TQ data.
+
+        Returns True by default — for standard Dispatch enum modes the
+        collect filtering is done at the Cluster level in collect_dp_mp_compute.
+        Override in subclasses for mesh-based dispatch modes.
+        """
+        return True
+
     def initialize(self, pipeline_config, *args, **kwargs):
         self.pipeline_config = pipeline_config
 

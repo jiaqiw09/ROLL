@@ -16,6 +16,9 @@ class ActorWorker(BaseActorWorker):
         """
         response_mask = data.batch["response_mask"][:, 1:].long()
         final_response_mask = data.batch.get("final_response_mask", response_mask)
+        print(f"ActorWorker.loss_func received data keys: {list(data.batch.keys())}")
+        if "ref_log_probs" not in data.batch.keys():
+            print(f"ERROR: ref_log_probs missing from data.batch! Available keys: {list(data.batch.keys())}")
         ref_log_probs = data.batch["ref_log_probs"]
         advantages = data.batch["advantages"]
 
@@ -47,7 +50,12 @@ class ActorWorker(BaseActorWorker):
             response_mask = response_mask.long() * filter_mask.long()
             final_response_mask = final_response_mask.long() * filter_mask.long()
         else:
-            train_infer_is_weight = data.batch['train_infer_is_weight']
+            if "train_infer_is_weight" not in data.batch.keys():
+                raise KeyError(
+                    f'train_infer_is_weight missing in actor input, keys={list(data.batch.keys())}, '
+                    f'enable_old_logprobs_recompute={self.pipeline_config.enable_old_logprobs_recompute}'
+                )
+            train_infer_is_weight = data.batch["train_infer_is_weight"]
 
         valid_samples = torch.any(final_response_mask > 0, dim=1).float()
         sample_weights = self.compute_sample_weights(data, response_mask)
@@ -201,4 +209,3 @@ class ActorWorker(BaseActorWorker):
             sample_weights = sample_weights * (batch_size / (sample_weights.sum() + 1e-8))
 
         return sample_weights
-

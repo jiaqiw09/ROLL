@@ -1,0 +1,171 @@
+defaults:
+  - ../config/deepspeed_zero@_here_
+  - ../config/deepspeed_zero2@_here_
+  - ../config/deepspeed_zero3@_here_
+  - ../config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "qwen2.5-7B-rlvr-config-sp2"
+seed: 42
+logging_dir: ./output/logs
+output_dir: ./output
+system_envs:
+  USE_MODELSCOPE: '1'
+
+
+track_with: tensorboard
+tracker_kwargs:
+  log_dir: /data/oss_bucket_0/rl_examples/llm/tensorboard/roll_exp/rlvr
+
+num_gpus_per_node: 8
+
+max_steps: 2
+save_steps: 2
+logging_steps: 1
+resume_from_checkpoint: false
+
+
+rollout_batch_size: 4  # prompt
+prompt_length: 2048
+response_length: 4096
+
+num_return_sequences_in_group: 4
+ppo_epochs: 1
+adv_estimator: "reinforce"
+
+# clip
+value_clip: 0.5
+reward_clip: 10
+advantage_clip: 2.0
+dual_clip_loss: true
+
+# normalize
+norm_mean_type: ~
+norm_std_type: ~
+
+# data mask
+max_len_mask: true
+difficulty_mask: true
+difficulty_low_threshold: 0.1
+difficulty_high_threshold: 0.95
+error_max_len_clip: false
+
+# data weight
+difficulty_loss_weight: false
+length_loss_weight: false
+
+# reward
+add_token_level_kl: false
+
+# advantage
+whiten_advantages: true
+
+# dynamic sampling scheduler
+# use_additional_prompts: true
+# max_running_requests: 256
+# is_num_return_sequences_expand: false
+
+pretrain: /home/wjq/Qwen3-4B
+reward_pretrain: /home/wjq/Qwen3-4B
+
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    ulysses_size: 2
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 8
+    warmup_steps: 20
+    num_train_epochs: 1
+  data_args:
+    template: qwen3
+    file_name:
+      # - data/code_KodCode_data.jsonl
+      # - data/llm_judge_Multi-subject-RLVR_deal_new.jsonl
+      # - data/math_deepmath_deal.jsonl
+      # - data/general_ifeval_train_deal.jsonl
+      - data/general_CrossThink-QA_deal.jsonl
+    domain_interleave_probs:
+      # math_rule: 0.4
+      # code_sandbox: 0.3
+      # llm_judge: 0.1
+      crossthinkqa: 1.0
+      # ifeval: 0.1
+    dataset_dir: data
+    messages: messages
+    interleave_probs: "1.0"
+    preprocessing_num_workers: 16
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero3}
+  device_mapping: list(range(0,2))
+  infer_batch_size: 1
+
+actor_infer:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${response_length}
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: ${num_return_sequences_in_group}
+  data_args:
+    template: qwen3
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.8
+      load_format: auto
+      block_size: 16
+      max_model_len: 8000
+  device_mapping: list(range(2,4))
+  infer_batch_size: 1
+
+reference:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    ulysses_size: 2
+    model_type: ~
+  data_args:
+    template: qwen3
+  strategy_args:
+    strategy_name: deepspeed_infer
+    strategy_config: ${deepspeed_zero3}
+  device_mapping: list(range(4,6))
+  infer_batch_size: 4
+
+rewards:
+  crossthinkqa:
+    worker_cls: roll.pipeline.rlvr.rewards.crossthinkqa_rule_reward_worker.CrossThinkQARuleRewardWorker
+    reward_type: soft
+    response_length_penalty_coef: 0.0
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    data_args:
+      template: qwen3
+    tag_included: [crossthinkqa]
+    world_size: 16
+    infer_batch_size: 4
+
+transfer_queue:
+  enable: true
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      total_storage_size: 100000
+      num_data_storage_units: 8
