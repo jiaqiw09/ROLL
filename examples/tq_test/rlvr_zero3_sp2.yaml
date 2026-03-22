@@ -16,18 +16,6 @@ output_dir: ./output
 system_envs:
   USE_MODELSCOPE: '1'
 
-checkpoint_config:
-  type: file_system
-  output_dir: /data/cpfs_0/rl_examples/models/${exp_name}
-
-#track_with: wandb
-#tracker_kwargs:
-#  api_key:
-#  project: roll_examples
-#  notes: roll_examples
-#  tags:
-#    - rlvr
-#    - baseline
 
 track_with: tensorboard
 tracker_kwargs:
@@ -35,18 +23,22 @@ tracker_kwargs:
 
 num_gpus_per_node: 8
 
-max_steps: 500
-save_steps: 100
+max_steps: 2
+save_steps: 2000
 logging_steps: 1
-eval_steps: 10
 resume_from_checkpoint: false
 
+# 开启 ReplayBuffer
+async_pipeline: true
+async_generation_ratio: 2.0  # 允许跨两步容忍拿数据
+generate_opt_level: 1        # 设置优化级别 1，启用异步 Buffer 流水线
 
-rollout_batch_size: 64  # prompt
+
+rollout_batch_size: 4  # prompt
 prompt_length: 2048
 response_length: 4096
 
-num_return_sequences_in_group: 8
+num_return_sequences_in_group: 4
 ppo_epochs: 1
 adv_estimator: "reinforce"
 
@@ -82,22 +74,8 @@ whiten_advantages: true
 # max_running_requests: 256
 # is_num_return_sequences_expand: false
 
-pretrain: Qwen/Qwen2.5-7B
-reward_pretrain: Qwen/Qwen2.5-7B
-
-validation:
-  data_args:
-    template: qwen2_5
-    file_name:
-      - data/math_benchmarks.jsonl
-  generating_args:
-    max_new_tokens: ${response_length}
-    top_p: 0.6
-    top_k: 50
-    num_beams: 1
-    temperature: 0.6
-    num_return_sequences: 1
-
+pretrain: /home/wjq/Qwen3-4B
+reward_pretrain: /home/wjq/Qwen3-4B
 
 actor_train:
   model_args:
@@ -110,31 +88,31 @@ actor_train:
     learning_rate: 1.0e-6
     weight_decay: 0
     per_device_train_batch_size: 1
-    gradient_accumulation_steps: 32
+    gradient_accumulation_steps: 8
     warmup_steps: 20
-    num_train_epochs: 50
+    num_train_epochs: 1
   data_args:
-    template: qwen2_5
+    template: qwen3
     file_name:
-      - data/code_KodCode_data.jsonl
-      - data/llm_judge_Multi-subject-RLVR_deal_new.jsonl
+      # - data/code_KodCode_data.jsonl
+      # - data/llm_judge_Multi-subject-RLVR_deal_new.jsonl
       - data/math_deepmath_deal.jsonl
-      - data/general_ifeval_train_deal.jsonl
+      # - data/general_ifeval_train_deal.jsonl
       - data/general_CrossThink-QA_deal.jsonl
     domain_interleave_probs:
-      math_rule: 0.4
-      code_sandbox: 0.3
-      llm_judge: 0.1
-      crossthinkqa: 0.1
-      ifeval: 0.1
+      math_rule: 0.5
+      # code_sandbox: 0.3
+      # llm_judge: 0.1
+      crossthinkqa: 0.5
+      # ifeval: 0.1
     dataset_dir: data
     messages: messages
-    interleave_probs: "1.0"
+    interleave_probs: "0.5,0.5"
     preprocessing_num_workers: 16
   strategy_args:
     strategy_name: deepspeed_train
     strategy_config: ${deepspeed_zero3}
-  device_mapping: list(range(0,8))
+  device_mapping: list(range(8,10))
   infer_batch_size: 1
 
 actor_infer:
@@ -150,14 +128,15 @@ actor_infer:
     temperature: 0.99
     num_return_sequences: ${num_return_sequences_in_group}
   data_args:
-    template: qwen2_5
+    template: qwen3
   strategy_args:
     strategy_name: vllm
     strategy_config:
       gpu_memory_utilization: 0.8
+      load_format: auto
       block_size: 16
       max_model_len: 8000
-  device_mapping: list(range(0,6))
+  device_mapping: list(range(10,12))
   infer_batch_size: 1
 
 reference:
@@ -168,11 +147,11 @@ reference:
     ulysses_size: 2
     model_type: ~
   data_args:
-    template: qwen2_5
+    template: qwen3
   strategy_args:
     strategy_name: deepspeed_infer
     strategy_config: ${deepspeed_zero3}
-  device_mapping: list(range(0,8))
+  device_mapping: list(range(12,14))
   infer_batch_size: 4
 
 rewards:
@@ -183,72 +162,26 @@ rewards:
     model_args:
       model_name_or_path: ${reward_pretrain}
     data_args:
-      template: qwen2_5
+      template: qwen3
     tag_included: [crossthinkqa]
-    world_size: 8
-    infer_batch_size: 4
-  ifeval:
-    worker_cls: roll.pipeline.rlvr.rewards.ifeval_rule_reward_worker.GeneralRuleRewardWorker
-    reward_type: soft
-    model_args:
-      model_name_or_path: ${reward_pretrain}
-    data_args:
-      template: qwen2_5
-    tag_included: [ifeval]
-    world_size: 8
+    world_size: 16
     infer_batch_size: 4
   math_rule:
     worker_cls: roll.pipeline.rlvr.rewards.math_rule_reward_worker.MathRuleRewardWorker
+    reward_type: soft
+    response_length_penalty_coef: 0.0
     model_args:
       model_name_or_path: ${reward_pretrain}
     data_args:
-      template: qwen2_5
-    tag_included: [deepmath_103k, aime]
-    world_size: 8
-    infer_batch_size: 1
-# dynamic filter config
-#    query_filter_config:
-#      type: mean_filter
-#      filter_args:
-#        threshold_up: 0.9
-#        threshold_down: 0.1
-  code_sandbox:
-    use_local: true
-    worker_cls: roll.pipeline.rlvr.rewards.code_sandbox_reward_worker.CodeSandboxRewardWorker
-    tag_included: [KodCode]
-    model_args:
-      model_name_or_path: ${reward_pretrain}
-    data_args:
-      template: qwen2_5
-    world_size: 8
-    infer_batch_size: 1
-#    query_filter_config:
-#      type: std_filter
-#      filter_args:
-#        std_threshold: 0
-  llm_judge:
-    # NOTE: llm as judge 也需要gpu, 不能和actor infer共享gpu
-    worker_cls: roll.pipeline.rlvr.rewards.llm_judge_reward_worker.LLMJudgeRewardWorker
-    judge_prompt: Qwen2.5-7B-Instruct-RLVR-prompt
-    judge_model_type: inference
-    tag_included: [RLVR]
-    model_args:
-      model_name_or_path: virtuoussy/Qwen2.5-7B-Instruct-RLVR
-      attn_implementation: fa2
-      disable_gradient_checkpointing: true
-      dtype: bf16
-      model_type: trl
-    generating_args:
-      max_new_tokens: 100
-      top_p: 0.8
-      top_k: 50
-      num_beams: 1
-      temperature: 0.8
-      num_return_sequences: 1
-    data_args:
-      template: qwen2_5
-    strategy_args:
-      strategy_name: hf_infer
-      strategy_config: null
-    device_mapping: list(range(6,8))
-    infer_batch_size: 2
+      template: qwen3
+    tag_included: [math]
+    world_size: 16
+    infer_batch_size: 4
+
+transfer_queue:
+  enable: true
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      total_storage_size: 100000
+      num_data_storage_units: 8
