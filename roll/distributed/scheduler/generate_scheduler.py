@@ -73,7 +73,8 @@ class ExperienceItem:
     prompt_id: int
     domain: str = "default"
     sampling_start_step: Optional[int] = None
-    data: Optional[DataProto] = None
+    data: Optional[Any] = None  # DataProto or KVBatchMeta when TQ enabled
+    score: Optional[float] = None
 
 
 class ItemsGroup:
@@ -513,6 +514,15 @@ class DynamicSamplingScheduler(RolloutMockMixin):
 
         self.reward_scheduler = RewardScheduler()
 
+        self.tq_enabled = (
+            getattr(pipeline_config, 'transfer_queue', None) is not None
+            and pipeline_config.transfer_queue.enable
+        )
+        if self.tq_enabled:
+            from roll.utils.tq_pipeline_utils import init_tq
+            init_tq(pipeline_config.transfer_queue)
+            print(f"[TQ] DynamicSamplingScheduler: TQ enabled, initialized in scheduler process")
+
     async def initialize(self):
         await self.router_manager.initialize()
         self.router_client = await RouterManager.create_client(self.router_manager)
@@ -645,32 +655,47 @@ class DynamicSamplingScheduler(RolloutMockMixin):
             assert len(finished_items) >= batch_size * num_return_sequences
             finished_items = finished_items[:batch_size * num_return_sequences]
         assert len(finished_items) == batch_size * num_return_sequences
-        batch = self.collect_items_as_batch(finished_items=finished_items)
+        result = self.collect_items_as_batch(finished_items=finished_items)
 
         if self.is_val or self.pipeline_config.async_generation_ratio <= 0:
             await self.pause_sampling()
             assert not self.replay_buffer.groups, f"{self.replay_buffer.groups=}"
 
+        timer_metrics = {}
         for domain in self.reward_clusters.keys():
-            metrics = {}
             generate_stat = self.generate_timer[domain].log()
-            metrics[f"scheduler/{domain}/time/generate/count"] = generate_stat["count"]
-            metrics[f"scheduler/{domain}/time/generate/min"] = generate_stat["min"]
-            metrics[f"scheduler/{domain}/time/generate/max"] = generate_stat["max"]
-            metrics[f"scheduler/{domain}/time/generate/mean"] = generate_stat["mean"]
+            timer_metrics[f"scheduler/{domain}/time/generate/count"] = generate_stat["count"]
+            timer_metrics[f"scheduler/{domain}/time/generate/min"] = generate_stat["min"]
+            timer_metrics[f"scheduler/{domain}/time/generate/max"] = generate_stat["max"]
+            timer_metrics[f"scheduler/{domain}/time/generate/mean"] = generate_stat["mean"]
             reward_stat = self.reward_timer[domain].log()
-            metrics[f"scheduler/{domain}/time/reward/count"] = reward_stat["count"]
-            metrics[f"scheduler/{domain}/time/reward/min"] = reward_stat["min"]
-            metrics[f"scheduler/{domain}/time/reward/max"] = reward_stat["max"]
-            metrics[f"scheduler/{domain}/time/reward/mean"] = reward_stat["mean"]
-            batch.meta_info["metrics"].update(metrics)
+            timer_metrics[f"scheduler/{domain}/time/reward/count"] = reward_stat["count"]
+            timer_metrics[f"scheduler/{domain}/time/reward/min"] = reward_stat["min"]
+            timer_metrics[f"scheduler/{domain}/time/reward/max"] = reward_stat["max"]
+            timer_metrics[f"scheduler/{domain}/time/reward/mean"] = reward_stat["mean"]
 
-        # DUMP MODE: Save merged batch (from mixin)
-        await self._maybe_dump_batch(batch, global_step)
+        if self.tq_enabled:
+            from roll.utils.tq_pipeline_utils import fmt_kv_meta
+            result.extra_info.setdefault("metrics", {}).update(timer_metrics)
+            print(f"[TQ] Scheduler.get_batch: returning KVBatchMeta to pipeline\n"
+                  f"  {fmt_kv_meta(result)}")
+        else:
+            result.meta_info["metrics"].update(timer_metrics)
+            # DUMP MODE: Save merged batch (from mixin)
+            await self._maybe_dump_batch(result, global_step)
 
-        return batch
+        return result
 
-    def collect_items_as_batch(self, finished_items: List[ExperienceItem]) -> DataProto:
+    def collect_items_as_batch(self, finished_items: List[ExperienceItem]):
+        """Collect finished ExperienceItems into a single batch.
+
+        Returns DataProto when TQ is disabled, KVBatchMeta when TQ is enabled.
+        """
+        if self.tq_enabled:
+            return self._collect_items_as_kv_batch_meta(finished_items)
+        return self._collect_items_as_dataproto(finished_items)
+
+    def _collect_items_as_dataproto(self, finished_items: List[ExperienceItem]) -> DataProto:
         collect_data_by_domain = defaultdict(list)
         data_off_policy_step = 0.0
         prompt_ids = set()
@@ -689,7 +714,6 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         logger.info(f"total collect data: {collect_data_num}, collect queries: {query_use_count}")
 
         batch = DataProto.concat(list(collect_data_by_domain.values()))
-        # TODO support response_filter_count and query_filter_count
         batch.meta_info.setdefault("metrics", {}).update({
             f"scheduler/collect_query_count": query_use_count,
             f"scheduler/query_use_count": query_use_count,
@@ -704,9 +728,78 @@ class DynamicSamplingScheduler(RolloutMockMixin):
             metrics[f"scheduler/{domain}/score/min"] = torch.min(sequence_score).detach().item()
         batch.meta_info["metrics"].update(metrics)
 
-        # TODO shigao implement REPORT_LENGTH_AND_REWARDS (deleted at refactor)
-
         return batch
+
+    def _collect_items_as_kv_batch_meta(self, finished_items: List[ExperienceItem]):
+        """Merge per-sample KVBatchMeta into one, with metrics computed from stored scores."""
+        from transfer_queue import KVBatchMeta
+
+        domain_keys = defaultdict(list)
+        domain_tags = defaultdict(list)
+        domain_scores = defaultdict(list)
+        domain_non_tensor = defaultdict(lambda: defaultdict(list))
+        data_off_policy_step = 0.0
+        prompt_ids = set()
+        partition_id = None
+        fields = None
+
+        for item in finished_items:
+            kv_meta = item.data
+            domain_keys[item.domain].extend(kv_meta.keys)
+            domain_tags[item.domain].extend(kv_meta.tags)
+            data_off_policy_step += self.replay_buffer.current_step - item.sampling_start_step
+            prompt_ids.add(item.prompt_id)
+            if item.score is not None:
+                domain_scores[item.domain].append(item.score)
+            if partition_id is None:
+                partition_id = kv_meta.partition_id
+                fields = list(kv_meta.fields) if kv_meta.fields else []
+            sample_ntb = (kv_meta.extra_info or {}).get("non_tensor_batch", {})
+            for k, v in sample_ntb.items():
+                domain_non_tensor[item.domain][k].extend(v)
+
+        data_off_policy_step /= len(finished_items)
+        query_use_count = len(prompt_ids)
+        _score_summary = {d: f"n={len(s)},mean={sum(s)/len(s):.3f}" for d, s in domain_scores.items()}
+        print(
+            f"[TQ] Scheduler.collect_items_as_batch: merging {len(finished_items)} "
+            f"KVBatchMeta items from {len(domain_keys)} domain(s)={list(domain_keys.keys())}, "
+            f"queries={query_use_count}, off_policy_ratio={data_off_policy_step:.2f}\n"
+            f"  domain_scores={_score_summary}"
+        )
+
+        # Preserve domain-grouped ordering (same as DataProto path)
+        all_keys = []
+        all_tags = []
+        merged_non_tensor = defaultdict(list)
+        for domain in domain_keys:
+            all_keys.extend(domain_keys[domain])
+            all_tags.extend(domain_tags[domain])
+            for k, v in domain_non_tensor[domain].items():
+                merged_non_tensor[k].extend(v)
+
+        metrics = {
+            "scheduler/collect_query_count": query_use_count,
+            "scheduler/query_use_count": query_use_count,
+            "scheduler/off_policy_ratio": data_off_policy_step,
+        }
+        for domain, scores in domain_scores.items():
+            scores_t = torch.tensor(scores)
+            metrics[f"scheduler/{domain}/score/mean"] = torch.mean(scores_t).item()
+            metrics[f"scheduler/{domain}/score/max"] = torch.max(scores_t).item()
+            metrics[f"scheduler/{domain}/score/min"] = torch.min(scores_t).item()
+
+        merged_kv_meta = KVBatchMeta(
+            keys=all_keys,
+            tags=all_tags,
+            partition_id=partition_id,
+            fields=fields,
+            extra_info={
+                "metrics": metrics,
+                "non_tensor_batch": dict(merged_non_tensor),
+            },
+        )
+        return merged_kv_meta
 
     async def sending_request(self):
         async with TaskGroup() as tg:
@@ -746,6 +839,66 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         return {"dataset_iter_count": self.dataset_iter_count}
 
 
+def _commit_tq_responses(
+    scheduler: "DynamicSamplingScheduler",
+    prompt_id: int,
+    domain: str,
+    sampling_start_step: int,
+    responses: List[DataProto],
+):
+    """Write response DataProtos to TQ and commit KVBatchMeta references to ReplayBuffer."""
+    from roll.utils.tq_pipeline_utils import dataproto_to_kv_batch_meta, fmt_kv_meta, fmt_dataproto
+    from transfer_queue import KVBatchMeta
+
+    combined = DataProto.concat(responses) if len(responses) > 1 else responses[0]
+    print(f"[TQ] _commit_tq_responses: prompt_id={prompt_id}, domain='{domain}', "
+          f"num_responses={len(responses)}\n"
+          f"  combined DataProto: {fmt_dataproto(combined)}")
+
+    tags = [{"domain": domain}] * len(responses)
+    kv_meta = dataproto_to_kv_batch_meta(combined, partition_id="train", tags=tags)
+
+    scores = (
+        combined.batch["scores"].detach().tolist()
+        if "scores" in combined.batch.keys()
+        else [0.0] * len(responses)
+    )
+
+    non_tensor = {}
+    if combined.non_tensor_batch:
+        for k, v in combined.non_tensor_batch.items():
+            if isinstance(v, np.ndarray):
+                non_tensor[k] = v.tolist()
+            elif hasattr(v, 'tolist'):
+                non_tensor[k] = v.tolist()
+            else:
+                non_tensor[k] = list(v) if hasattr(v, '__iter__') else [v] * len(responses)
+
+    items = []
+    for i in range(len(responses)):
+        sample_kv = KVBatchMeta(
+            keys=[kv_meta.keys[i]],
+            tags=[kv_meta.tags[i]],
+            partition_id=kv_meta.partition_id,
+            fields=list(kv_meta.fields) if kv_meta.fields else [],
+            extra_info={
+                "non_tensor_batch": {k: [v[i]] for k, v in non_tensor.items()} if non_tensor else {},
+            },
+        )
+        items.append(ExperienceItem(
+            prompt_id=prompt_id,
+            domain=domain,
+            sampling_start_step=sampling_start_step,
+            data=sample_kv,
+            score=float(scores[i]) if i < len(scores) else 0.0,
+        ))
+
+    scheduler.replay_buffer.commit(prompt_id, items)
+    print(f"[TQ] _commit_tq_responses: committed {len(items)} ExperienceItem(KVBatchMeta) to ReplayBuffer\n"
+          f"  scores={scores}, non_tensor_keys={list(non_tensor.keys())}\n"
+          f"  sample item[0].data: {fmt_kv_meta(items[0].data)}")
+
+
 class RolloutContext:
     """
     Helper class to manage life cycle of rollout of a prompt.
@@ -781,6 +934,13 @@ class RolloutContext:
             # commit/abort should be put at last in finally block, because commit may raise exception
             if not success:
                 scheduler.replay_buffer.abort(prompt_id)
+            elif scheduler.tq_enabled:
+                print(f"[TQ] process_new_prompt: TQ path → writing responses to TQ (prompt_id={prompt_id})")
+                assert context.sampling_start_step is not None
+                _commit_tq_responses(
+                    scheduler, prompt_id, context.domain,
+                    context.sampling_start_step, responses,
+                )
             else:
                 assert context.sampling_start_step is not None
                 scheduler.replay_buffer.commit(

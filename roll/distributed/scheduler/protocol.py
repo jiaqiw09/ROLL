@@ -857,6 +857,67 @@ class DataProto:
         return DataProto.concat(data, global_keys=global_keys)
 
 
+class BatchData:
+    """Type-agnostic wrapper for chunk/concat in the dispatch/collect pipeline.
+
+    Handles DataProto, list, and (when installed) TransferQueue
+    BatchMeta / KVBatchMeta transparently, so that decorator.py does not
+    need to know about TQ at all.
+    """
+
+    def __init__(self, data):
+        self._data = data
+
+    def chunk(self, chunks: int):
+        data = self._data
+
+        if isinstance(data, DataProto):
+            return data.chunk(chunks=chunks)
+
+        if isinstance(data, list):
+            from more_itertools import chunked
+            return list(chunked(data, len(data) // chunks))
+
+        try:
+            from transfer_queue import KVBatchMeta
+            if isinstance(data, KVBatchMeta):
+                from roll.utils.transferqueue_utils import kv_batch_meta2batch_meta
+                data = kv_batch_meta2batch_meta(data)
+        except ImportError:
+            pass
+
+        assert hasattr(data, "chunk"), f"{type(data).__name__} does not have a 'chunk' method."
+        return data.chunk(chunks=chunks)
+
+    @staticmethod
+    def concat(data_list):
+        """Concatenate a list of homogeneous data objects into one."""
+        if not data_list:
+            return data_list
+
+        sample = data_list[0]
+
+        if isinstance(sample, DataProto):
+            return DataProto.concat(data_list)
+
+        if isinstance(sample, list):
+            from itertools import chain
+            return list(chain.from_iterable(data_list))
+
+        try:
+            from transfer_queue import BatchMeta
+            if isinstance(sample, BatchMeta):
+                merged = BatchMeta.concat(data_list)
+                from roll.utils.transferqueue_utils import batch_meta2kv_batch_meta
+                return batch_meta2kv_batch_meta(merged)
+        except ImportError:
+            pass
+
+        raise NotImplementedError(
+            f"BatchData.concat does not support type {type(sample).__name__}"
+        )
+
+
 class ObjectRefWrap:
     def __init__(self, obj_ref: ray.ObjectRef, collected=False):
         self.obj_ref = obj_ref

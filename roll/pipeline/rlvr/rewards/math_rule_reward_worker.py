@@ -304,13 +304,13 @@ class MathRuleRewardWorker(Worker):
             long_block_penalty_rewards.append(long_block_penalty_reward_fn(response))
             response_length_rewards.append(len(response) / 20000)
             
-        token_level_rewards = torch.zeros_like(data.batch["responses"], dtype=torch.float16)
-        response_length_rewards = torch.tensor(response_length_rewards, dtype=torch.float16)
-        repetition_penalty_rewards = torch.tensor(repetition_penalty_rewards, dtype=torch.float16)
-        long_block_penalty_rewards = torch.tensor(long_block_penalty_rewards, dtype=torch.float16)
-        format_rewards = torch.tensor(format_rewards, dtype=torch.float16)
-        scores = torch.tensor(verify_answer, dtype=torch.float16)
-        response_level_rewards = torch.tensor(verify_answer, dtype=torch.float16)
+        token_level_rewards = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        response_length_rewards = torch.tensor(response_length_rewards, dtype=torch.float32)
+        repetition_penalty_rewards = torch.tensor(repetition_penalty_rewards, dtype=torch.float32)
+        long_block_penalty_rewards = torch.tensor(long_block_penalty_rewards, dtype=torch.float32)
+        format_rewards = torch.tensor(format_rewards, dtype=torch.float32)
+        scores = torch.tensor(verify_answer, dtype=torch.float32)
+        response_level_rewards = torch.tensor(verify_answer, dtype=torch.float32)
 
         output = DataProto.from_dict(
             tensors={

@@ -229,12 +229,16 @@ class CrossThinkQARuleRewardWorker(Worker):
                 self.logger.debug(outputs)
             except Exception as e:
                 self.logger.error(f"answer check except: {e}")
-
-        token_level_rewards = torch.zeros_like(data.batch["responses"], dtype=torch.float16)
-        crossthinkqa_rewards = torch.tensor(crossthinkqa_rewards, dtype=torch.float16)
-        scores = torch.tensor(scores, dtype=torch.float16)
-        repetition_penalty_rewards = torch.tensor(repetition_penalty_rewards, dtype=torch.float16)
-        response_length_rewards = torch.tensor(response_length_rewards, dtype=torch.float16)
+        # crossthinkqa_rule_reward_worker.py 中 reward worker 将 token_level_rewards、scores、response_level_rewards 等张量以 torch.float16 类型创建并存入 TransferQueue (TQ)
+        # RLVR pipeline 从 TQ 读取数据后，在 compute_advantage 函数中通过 .float() 将 token_level_rewards 转为 torch.float32
+        # Pipeline 随后尝试将 float32 的 token_level_rewards 写回 TQ，但 TQ 中该字段已注册为 float16，触发 dtype 不匹配校验
+        # dtype 不匹配导致整个写回操作失败（update_production_status 返回 False），所有待写回的字段（包括 train_infer_is_weight）都未能存入 TQ
+        # 最终 actor worker 训练时从 TQ 读取数据，发现 train_infer_is_weight 缺失，抛出 KeyError
+        token_level_rewards = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        crossthinkqa_rewards = torch.tensor(crossthinkqa_rewards, dtype=torch.float32)
+        scores = torch.tensor(scores, dtype=torch.float32)
+        repetition_penalty_rewards = torch.tensor(repetition_penalty_rewards, dtype=torch.float32)
+        response_length_rewards = torch.tensor(response_length_rewards, dtype=torch.float32)
 
         response_level_rewards = (
             crossthinkqa_rewards
@@ -242,8 +246,8 @@ class CrossThinkQARuleRewardWorker(Worker):
             + self.response_length_penalty_coef * response_length_rewards
         )
 
-        format_values = torch.tensor(format_values, dtype=torch.float16)
-        correct_values = torch.tensor(correct_values, dtype=torch.float16)
+        format_values = torch.tensor(format_values, dtype=torch.float32)
+        correct_values = torch.tensor(correct_values, dtype=torch.float32)
 
         # 5) 将这些张量打包进同一个字典
         # TODO: 不同的reward worker的output是否需要统一output，或者有没有自适应的办法，避免在新增监控量时每个worker都需要修改

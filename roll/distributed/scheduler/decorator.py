@@ -7,9 +7,7 @@ import os
 import traceback
 from enum import Enum, auto
 from functools import wraps, partial
-from itertools import chain
 from typing import Tuple, List, Dict
-from more_itertools import chunked
 import ray
 import torch
 import asyncio
@@ -21,7 +19,6 @@ from roll.platforms import current_platform
 logger = get_logger()
 
 BIND_WORKER_METHOD_FLAG = "BIND_WORKER_METHOD_FLAG"
-
 
 class Dispatch(Enum):
     """
@@ -45,22 +42,10 @@ def _split_args_kwargs(chunks, *args, **kwargs):
     """
     arg: List, 将List分成dp份
     """
+    from roll.distributed.scheduler.protocol import BatchData
 
-    def split(arg, chunks):
-        if isinstance(arg, list):
-            return list(chunked(arg, len(arg) // chunks))
-        else:
-            assert hasattr(arg, "chunk"), f"Argument {arg} does not have a 'chunk' method."
-            return arg.chunk(chunks=chunks)
-
-    splitted_args = []
-    for arg in args:
-        splitted_args.append(split(arg, chunks))
-
-    splitted_kwargs = {}
-    for key, val in kwargs.items():
-        splitted_kwargs[key] = split(val, chunks)
-
+    splitted_args = [BatchData(arg).chunk(chunks) for arg in args]
+    splitted_kwargs = {key: BatchData(val).chunk(chunks) for key, val in kwargs.items()}
     return splitted_args, splitted_kwargs
 
 
@@ -115,12 +100,9 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
 
     def get_arg_by_rank_info(arg, rank_info):
         local_dp_rank = rank_info.dp_rank
-        if (
-            _dispatch_first
-            and isinstance(arg[local_dp_rank], DataProto)
-            and not (rank_info.tp_rank == 0 and rank_info.cp_rank == 0 and rank_info.pp_rank == 0)
-        ):
-            return DataProto(batch=None, meta_info=arg[local_dp_rank].meta_info)
+        if _dispatch_first and not (rank_info.tp_rank == 0 and rank_info.cp_rank == 0 and rank_info.pp_rank == 0):
+            if isinstance(arg[local_dp_rank], DataProto):
+                return DataProto(batch=None, meta_info=arg[local_dp_rank].meta_info)
         return arg[local_dp_rank]
 
     for arg in splitted_args:
@@ -156,31 +138,32 @@ def collect_dp_mp_compute(cluster, output):
     只需要搜集tp=0, pipeline_last_stage的结果
     输入输出都是list, 是batch维度的
     """
+    if isinstance(output[0], ray.ObjectRef):
+        return _collect_object_refs(cluster, output)
+
     output_in_dp = []
     for global_rank in range(cluster.world_size):
         local_rank_info = cluster.get_rank_info(rank=global_rank)
         if local_rank_info.tp_rank == 0 and local_rank_info.is_pipeline_last_stage and local_rank_info.cp_rank == 0:
             output_in_dp.append(output[global_rank])
-    if isinstance(output[0], list):
-        return list(chain.from_iterable(output_in_dp))
-    elif isinstance(output[0], DataProto):
-        return DataProto.concat(output_in_dp)
-    elif isinstance(output[0], ray.ObjectRef):
-        # 处理block=False情况下，dp内的可能完成时间不一致问题
-        output_in_dp = []
-        for global_rank in range(cluster.world_size):
-            local_rank_info = cluster.get_rank_info(rank=global_rank)
-            collected = False
-            if (
-                local_rank_info.tp_rank == 0
-                and local_rank_info.is_pipeline_last_stage
-                and local_rank_info.cp_rank == 0
-            ):
-                collected = True
-            output_in_dp.append(ObjectRefWrap(output[global_rank], collected=collected))
-        return output_in_dp
-    else:
-        raise NotImplementedError(f"output type {type(output[0])}")
+
+    from roll.distributed.scheduler.protocol import BatchData
+    return BatchData.concat(output_in_dp)
+
+
+def _collect_object_refs(cluster, output):
+    output_in_dp = []
+    for global_rank in range(cluster.world_size):
+        local_rank_info = cluster.get_rank_info(rank=global_rank)
+        collected = False
+        if (
+            local_rank_info.tp_rank == 0
+            and local_rank_info.is_pipeline_last_stage
+            and local_rank_info.cp_rank == 0
+        ):
+            collected = True
+        output_in_dp.append(ObjectRefWrap(output[global_rank], collected=collected))
+    return output_in_dp
 
 
 predefined_dispatch_mode_fn = {
