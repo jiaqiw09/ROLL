@@ -132,6 +132,7 @@ class ActorWorker(Worker):
         global_step = data.meta_info.get("global_step", 0)
         is_offload_states = data.meta_info.get("is_offload_states", True)
         metrics = {}
+        output_name = data.meta_info.get("output_name", "log_probs")
         with state_offload_manger(
             strategy=self.strategy,
             metrics=metrics,
@@ -149,7 +150,7 @@ class ActorWorker(Worker):
                 )
             if results is None:
                 return DataProto(batch=None, meta_info={"metrics": metrics})
-            output = DataProto.from_dict(tensors={"log_probs": results["log_probs"], "entropy": results["entropy"]})
+            output = DataProto.from_dict(tensors={output_name: results["log_probs"], "entropy": results["entropy"]})
             output = output.to("cpu")
             data.to("cpu")
         output.meta_info = {"metrics": metrics}

@@ -593,15 +593,19 @@ class RLVRPipeline(BasePipeline):
                             from roll.utils.tq_pipeline_utils import (
                                 kv_batch_meta_to_dataproto, kv_batch_meta_put_fields,
                             )
+                            kv_meta.extra_info["output_name"] = "ref_log_probs"
                             if not self.use_ref_model:
                                 kv_meta.extra_info["disable_adapter"] = True
                                 kv_meta.extra_info["is_offload_states"] = False
                                 self.actor_train.compute_log_probs(kv_meta, blocking=True)
                             else:
                                 self.reference.compute_log_probs(kv_meta, blocking=True)
-                            ref_fields = kv_batch_meta_to_dataproto(kv_meta, fields=["log_probs"])
-                            ref_fields.rename(old_keys="log_probs", new_keys="ref_log_probs")
-                            kv_batch_meta_put_fields(kv_meta, ref_fields, field_keys=["ref_log_probs"])
+                            
+                            kv_meta.extra_info.pop("output_name", None)
+                            if kv_meta.fields is not None and "ref_log_probs" not in kv_meta.fields:
+                                kv_meta.fields.append("ref_log_probs")
+
+                            ref_fields = kv_batch_meta_to_dataproto(kv_meta, fields=["ref_log_probs"])
                             batch.batch["ref_log_probs"] = ref_fields.batch["ref_log_probs"]
                         else:
                             worker_config = self.pipeline_config.reference if self.use_ref_model else self.pipeline_config.actor_train
@@ -646,18 +650,24 @@ class RLVRPipeline(BasePipeline):
                             self.critic.compute_values(kv_meta, blocking=True)
 
                         if self.pipeline_config.enable_old_logprobs_recompute:
+                            kv_meta.extra_info["output_name"] = "old_log_probs"
                             self.actor_train.compute_log_probs(kv_meta, blocking=True)
-                            old_fields = kv_batch_meta_to_dataproto(kv_meta, fields=["log_probs", "entropy"])
+                            
+                            kv_meta.extra_info.pop("output_name", None)
+                            if kv_meta.fields is not None and "old_log_probs" not in kv_meta.fields:
+                                kv_meta.fields.append("old_log_probs")
+
+                            old_fields = kv_batch_meta_to_dataproto(kv_meta, fields=["old_log_probs", "entropy"])
                             agg_entropy = agg_loss(
                                 loss_mat=old_fields.batch["entropy"],
                                 loss_mask=batch.batch["response_mask"][:, 1:],
                                 loss_agg_mode="token-mean",
                             )
                             batch.meta_info["agg_entropy"] = agg_entropy
-                            batch.batch["old_log_probs"] = old_fields.batch["log_probs"]
-                            old_fields.batch["old_log_probs"] = old_fields.batch["log_probs"]
+                            batch.batch["old_log_probs"] = old_fields.batch["old_log_probs"]
                             kv_batch_meta_put_fields(kv_meta, old_fields, field_keys=["old_log_probs"])
                         else:
+                            kv_meta.extra_info.pop("output_name", None)
                             batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
                             zero_dp = DataProto(batch=batch.batch.select("old_log_probs"))
                             kv_batch_meta_put_fields(kv_meta, zero_dp, field_keys=["old_log_probs"])
