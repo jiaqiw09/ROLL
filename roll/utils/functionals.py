@@ -19,6 +19,7 @@ from roll.configs.base_config import PPOConfig
 from roll.pipeline.rlvr.rlvr_config import RLVRConfig
 from roll.platforms import current_platform
 from roll.utils.kl_controller import AdaptiveKLController
+from roll.utils.transferqueue_utils import kv_tqbridge
 from roll.utils.logging import get_logger
 
 logger = get_logger()
@@ -608,6 +609,7 @@ def difficulty_mask(data: "DataProto", n_sample=-1, low_threshold=0.1, high_thre
     return data
 
 
+@kv_tqbridge(writeback_fields=["token_level_rewards", "token_level_scores"])
 @torch.no_grad()
 def compute_token_reward(data: "DataProto", pipeline_config: PPOConfig, kl_ctrl: AdaptiveKLController):
     token_level_rewards = expand_to_token_level(data)
@@ -644,6 +646,7 @@ def compute_token_reward(data: "DataProto", pipeline_config: PPOConfig, kl_ctrl:
     return data, metrics
 
 
+@kv_tqbridge(writeback_fields=["response_level_rewards"])
 @torch.no_grad()
 def reward_postprocess(data: "DataProto", pipeline_config: RLVRConfig, running_ctrl):
     response_level_rewards = data.batch["response_level_rewards"].clone().detach()
@@ -675,6 +678,7 @@ def reward_postprocess(data: "DataProto", pipeline_config: RLVRConfig, running_c
     return data, response_level_metrics
 
 
+@kv_tqbridge(writeback_fields=["origin_response_mask", "final_response_mask", "difficulty_mask"])
 @torch.no_grad()
 def get_sample_level_mask(data: "DataProto", pipeline_config: RLVRConfig):
     batch_size = data.batch["response_mask"].size(0)
@@ -770,6 +774,7 @@ def apply_kl_penalty(data: "DataProto", kl_ctrl: AdaptiveKLController, kl_penalt
     return data, metrics
 
 
+@kv_tqbridge(writeback_fields=["advantages", "returns", "raw_advantages", "token_level_rewards", "values"])
 @torch.no_grad()
 def compute_advantage(
     data: "DataProto",
@@ -783,7 +788,12 @@ def compute_advantage(
     pipeline_config=None,
 ):
     if response_mask is None:
-        response_mask = data.batch["response_mask"][:, 1:]
+        # When called via kv_tqbridge, final_response_mask has been written
+        # to TQ by get_sample_level_mask and is now available in data.batch.
+        if "final_response_mask" in data.batch.keys():
+            response_mask = data.batch["final_response_mask"]
+        else:
+            response_mask = data.batch["response_mask"][:, 1:]
     if response_mask.sum() == 0:
         whiten_rewards = False
         whiten_advantages = False

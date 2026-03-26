@@ -736,54 +736,148 @@ class RLVRPipeline(BasePipeline):
                 metrics_mgr.add_metric("time/old_log_probs", cal_old_logpb_timer.last)
 
                 # 要按domain group by处理reward
-                batch.reorder(indices=torch.argsort(batch.batch["prompt_id"]))
-                batch_grouped: Dict[str, DataProto] = batch.group_by("domain")
-                batch_list = []
-                for domain, domain_batch in batch_grouped.items():
-                    # 1. 处理mask相关策略， 获取sample level mask
-                    with Timer(name="get_sample_level_mask", logger=None) as get_sample_level_mask_timer:
-                        domain_batch, mask_metrics = get_sample_level_mask(domain_batch, self.pipeline_config)
-                        metrics_mgr.add_domain_metrics(domain, mask_metrics)
-                    metrics_mgr.add_domain_metrics(domain, {"time/get_sample_level_mask": get_sample_level_mask_timer.last})
+                if self.tq_enabled:
+                    from roll.utils.tq_pipeline_utils import (
+                        kv_batch_meta_to_dataproto,
+                        fmt_kv_meta as _fmt_kv3,
+                    )
+                    from transfer_queue import KVBatchMeta
+                    print(f"[TQ] Pipeline.run: ===== TQ DOMAIN POST-PROCESSING =====")
 
-                    # 2. 处理reward相关策略
-                    with Timer(name="reward_postprocess", logger=None) as reward_postprocess_timer:
-                        domain_batch, response_level_metrics = reward_postprocess(
-                            domain_batch, self.pipeline_config, self.running
+                    # --- 按 domain tag 拆分 kv_meta ---
+                    domain_indices: Dict[str, List[int]] = {}
+                    for i, tag in enumerate(kv_meta.tags):
+                        dom = tag.get("domain", "default") if isinstance(tag, dict) else "default"
+                        domain_indices.setdefault(dom, []).append(i)
+
+                    domain_kv_metas: Dict[str, KVBatchMeta] = {}
+                    for dom, indices in domain_indices.items():
+                        sub_keys = [kv_meta.keys[i] for i in indices]
+                        sub_tags = [kv_meta.tags[i] for i in indices]
+                        domain_kv_metas[dom] = KVBatchMeta(
+                            keys=sub_keys,
+                            tags=sub_tags,
+                            partition_id=kv_meta.partition_id,
+                            fields=list(kv_meta.fields) if kv_meta.fields else [],
+                            extra_info=dict(kv_meta.extra_info) if kv_meta.extra_info else {},
                         )
-                        metrics_mgr.add_domain_metrics(domain, response_level_metrics)
-                    metrics_mgr.add_domain_metrics(domain, {"time/reward_postprocess": reward_postprocess_timer.last})
+                    print(f"[TQ] Pipeline.run: split kv_meta into {len(domain_kv_metas)} domain(s): "
+                          f"{[f'{d}({len(idx)})' for d, idx in domain_indices.items()]}")
 
-                    # 3. 计算token level rewards
-                    with Timer(name="get_token_reward", logger=None) as get_token_reward_timer:
-                        domain_batch, token_level_metrics = compute_token_reward(
-                            domain_batch, self.pipeline_config, self.kl_ctrl
-                        )
-                        metrics_mgr.add_domain_metrics(domain, token_level_metrics)
-                    metrics_mgr.add_domain_metrics(domain, {"time/get_token_reward": get_token_reward_timer.last})
+                    # --- 直接以 KVBatchMeta 为入参调用各计算函数 ---
+                    # @kv_tqbridge 装饰器自动完成: 从 TQ 拉取 → DataProto → 计算 → 写回 TQ
+                    for domain, domain_kv in domain_kv_metas.items():
+                        # 1. 处理mask相关策略
+                        with Timer(name="get_sample_level_mask", logger=None) as get_sample_level_mask_timer:
+                            domain_kv, mask_metrics = get_sample_level_mask(domain_kv, self.pipeline_config)
+                            metrics_mgr.add_domain_metrics(domain, mask_metrics)
+                        metrics_mgr.add_domain_metrics(domain, {"time/get_sample_level_mask": get_sample_level_mask_timer.last})
 
-                    # 4. 计算advantage
-                    final_response_mask = domain_batch.batch["final_response_mask"].clone()
-                    with Timer(name="compute_advantage", logger=None) as compute_advantage_timer:
-                        domain_batch = compute_advantage(
-                            data=domain_batch,
-                            gamma=self.pipeline_config.gamma,
-                            lambd=self.pipeline_config.lambd,
-                            adv_estimator=self.pipeline_config.adv_estimator,
-                            advantage_clip=self.pipeline_config.advantage_clip,
-                            whiten_advantages=self.pipeline_config.whiten_advantages,
-                            whiten_rewards=self.pipeline_config.whiten_rewards,
-                            response_mask=final_response_mask,
-                            pipeline_config=self.pipeline_config,
-                        )
-                        domain_metrics = reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
-                        metrics_mgr.add_domain_metrics(domain, domain_metrics)
-                        batch_list.append(domain_batch)
-                    metrics_mgr.add_domain_metrics(domain, {"time/compute_advantage": compute_advantage_timer.last})
-                    if self.pipeline_config.save_logging_board_dir:
-                        self.save_metrics(domain_batch)
+                        # 2. 处理reward相关策略
+                        with Timer(name="reward_postprocess", logger=None) as reward_postprocess_timer:
+                            domain_kv, response_level_metrics = reward_postprocess(
+                                domain_kv, self.pipeline_config, self.running
+                            )
+                            metrics_mgr.add_domain_metrics(domain, response_level_metrics)
+                        metrics_mgr.add_domain_metrics(domain, {"time/reward_postprocess": reward_postprocess_timer.last})
 
-                batch = DataProto.concat(batch_list)
+                        # 3. 计算token level rewards
+                        with Timer(name="get_token_reward", logger=None) as get_token_reward_timer:
+                            domain_kv, token_level_metrics = compute_token_reward(
+                                domain_kv, self.pipeline_config, self.kl_ctrl
+                            )
+                            metrics_mgr.add_domain_metrics(domain, token_level_metrics)
+                        metrics_mgr.add_domain_metrics(domain, {"time/get_token_reward": get_token_reward_timer.last})
+
+                        # 4. 计算advantage (response_mask 自动从 final_response_mask 获取)
+                        with Timer(name="compute_advantage", logger=None) as compute_advantage_timer:
+                            domain_kv = compute_advantage(
+                                data=domain_kv,
+                                gamma=self.pipeline_config.gamma,
+                                lambd=self.pipeline_config.lambd,
+                                adv_estimator=self.pipeline_config.adv_estimator,
+                                advantage_clip=self.pipeline_config.advantage_clip,
+                                whiten_advantages=self.pipeline_config.whiten_advantages,
+                                whiten_rewards=self.pipeline_config.whiten_rewards,
+                                pipeline_config=self.pipeline_config,
+                            )
+                            domain_metrics = reduce_metrics(domain_kv.extra_info.pop("metrics", {}))
+                            metrics_mgr.add_domain_metrics(domain, domain_metrics)
+                        metrics_mgr.add_domain_metrics(domain, {"time/compute_advantage": compute_advantage_timer.last})
+
+                        # 更新回 domain_kv_metas
+                        domain_kv_metas[domain] = domain_kv
+
+                    # --- 重建合并后的 kv_meta ---
+                    merged_keys = []
+                    merged_tags = []
+                    merged_fields_set = set(kv_meta.fields) if kv_meta.fields else set()
+                    for dom, dkv in domain_kv_metas.items():
+                        merged_keys.extend(dkv.keys)
+                        merged_tags.extend(dkv.tags)
+                        if dkv.fields:
+                            merged_fields_set.update(dkv.fields)
+                    kv_meta = KVBatchMeta(
+                        keys=merged_keys,
+                        tags=merged_tags,
+                        partition_id=kv_meta.partition_id,
+                        fields=list(merged_fields_set),
+                        extra_info=kv_meta.extra_info,
+                    )
+
+                    # 从 TQ 拉取完整 batch 供下游使用 (metrics, mask check, train_step等)
+                    batch = kv_batch_meta_to_dataproto(kv_meta)
+                    print(f"[TQ] Pipeline.run: post-processing done, reassembled kv_meta:\n"
+                          f"  {_fmt_kv3(kv_meta)}")
+                else:
+                    batch.reorder(indices=torch.argsort(batch.batch["prompt_id"]))
+                    batch_grouped: Dict[str, DataProto] = batch.group_by("domain")
+                    batch_list = []
+                    for domain, domain_batch in batch_grouped.items():
+                        # 1. 处理mask相关策略， 获取sample level mask
+                        with Timer(name="get_sample_level_mask", logger=None) as get_sample_level_mask_timer:
+                            domain_batch, mask_metrics = get_sample_level_mask(domain_batch, self.pipeline_config)
+                            metrics_mgr.add_domain_metrics(domain, mask_metrics)
+                        metrics_mgr.add_domain_metrics(domain, {"time/get_sample_level_mask": get_sample_level_mask_timer.last})
+
+                        # 2. 处理reward相关策略
+                        with Timer(name="reward_postprocess", logger=None) as reward_postprocess_timer:
+                            domain_batch, response_level_metrics = reward_postprocess(
+                                domain_batch, self.pipeline_config, self.running
+                            )
+                            metrics_mgr.add_domain_metrics(domain, response_level_metrics)
+                        metrics_mgr.add_domain_metrics(domain, {"time/reward_postprocess": reward_postprocess_timer.last})
+
+                        # 3. 计算token level rewards
+                        with Timer(name="get_token_reward", logger=None) as get_token_reward_timer:
+                            domain_batch, token_level_metrics = compute_token_reward(
+                                domain_batch, self.pipeline_config, self.kl_ctrl
+                            )
+                            metrics_mgr.add_domain_metrics(domain, token_level_metrics)
+                        metrics_mgr.add_domain_metrics(domain, {"time/get_token_reward": get_token_reward_timer.last})
+
+                        # 4. 计算advantage
+                        final_response_mask = domain_batch.batch["final_response_mask"].clone()
+                        with Timer(name="compute_advantage", logger=None) as compute_advantage_timer:
+                            domain_batch = compute_advantage(
+                                data=domain_batch,
+                                gamma=self.pipeline_config.gamma,
+                                lambd=self.pipeline_config.lambd,
+                                adv_estimator=self.pipeline_config.adv_estimator,
+                                advantage_clip=self.pipeline_config.advantage_clip,
+                                whiten_advantages=self.pipeline_config.whiten_advantages,
+                                whiten_rewards=self.pipeline_config.whiten_rewards,
+                                response_mask=final_response_mask,
+                                pipeline_config=self.pipeline_config,
+                            )
+                            domain_metrics = reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
+                            metrics_mgr.add_domain_metrics(domain, domain_metrics)
+                            batch_list.append(domain_batch)
+                        metrics_mgr.add_domain_metrics(domain, {"time/compute_advantage": compute_advantage_timer.last})
+                        if self.pipeline_config.save_logging_board_dir:
+                            self.save_metrics(domain_batch)
+
+                    batch = DataProto.concat(batch_list)
 
                 if batch.batch["final_response_mask"].sum() == 0:
                     logger.info("Warning: final_response_mask.sum() == 0! Current step will be skipped.")

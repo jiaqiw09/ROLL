@@ -255,7 +255,130 @@ def kv_batch_meta_put_tensordict(meta, td: TensorDict, func_name: str = "kv_batc
 
 
 # ---------------------------------------------------------------------------
-# @tqbridge decorator
+# @kv_tqbridge decorator — for pipeline-local functions accepting KVBatchMeta
+# ---------------------------------------------------------------------------
+
+def kv_tqbridge(writeback_fields=None):
+    """Decorator for pipeline-local functions to transparently accept KVBatchMeta.
+
+    When the first ``data`` argument is a KVBatchMeta:
+      1. Fetches tensor data from TQ into a DataProto
+      2. Calls the original function with the DataProto
+      3. Writes back *writeback_fields* to TQ
+      4. Syncs DataProto.meta_info → KVBatchMeta.extra_info
+      5. Returns KVBatchMeta in place of DataProto in the return value
+
+    When the first ``data`` argument is a DataProto (TQ disabled), acts as a
+    zero-overhead pass-through — the function is called unchanged.
+
+    Args:
+        writeback_fields: List of tensor field names to write back to TQ after
+            the function completes.  Only fields that actually exist in the
+            output DataProto's batch will be written.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def inner(*args, **kwargs):
+            # --- Detect KVBatchMeta in arguments ---
+            tq_mod, _, KVBatchMeta_cls = _ensure_tq_imports()
+
+            kv_meta = None
+            kv_arg_pos = None  # int → positional, str → kwarg key
+
+            for idx, arg in enumerate(args):
+                if isinstance(arg, KVBatchMeta_cls):
+                    kv_meta = arg
+                    kv_arg_pos = idx
+                    break
+
+            if kv_meta is None:
+                for key in ("data",):
+                    if key in kwargs and isinstance(kwargs[key], KVBatchMeta_cls):
+                        kv_meta = kwargs[key]
+                        kv_arg_pos = key
+                        break
+
+            if kv_meta is None:
+                # No KVBatchMeta found → pure pass-through
+                return func(*args, **kwargs)
+
+            # --- KVBatchMeta path ---
+            global TQ_INITIALIZED
+            if not TQ_INITIALIZED:
+                tq_mod.init()
+                TQ_INITIALIZED = True
+
+            from roll.utils.tq_pipeline_utils import (
+                kv_batch_meta_to_dataproto as _kv2dp,
+                kv_batch_meta_put_fields as _kv_put,
+            )
+
+            t0 = time.time()
+            data = _kv2dp(kv_meta)
+            data.meta_info = dict(kv_meta.extra_info) if kv_meta.extra_info else {}
+            t1 = time.time()
+
+            logger.info(
+                f"[TQ] @kv_tqbridge [{func.__name__}] fetched "
+                f"{len(kv_meta.keys)} samples from TQ, cost={t1 - t0:.3f}s"
+            )
+
+            # Replace KVBatchMeta with DataProto in the call
+            if isinstance(kv_arg_pos, int):
+                args = list(args)
+                args[kv_arg_pos] = data
+                args = tuple(args)
+            else:
+                kwargs[kv_arg_pos] = data
+
+            # --- Call original function ---
+            result = func(*args, **kwargs)
+
+            # --- Unpack return value ---
+            if isinstance(result, tuple):
+                out_data = result[0]
+                rest = result[1:]
+            else:
+                out_data = result
+                rest = None
+
+            # --- Write back fields to TQ ---
+            if (
+                writeback_fields
+                and hasattr(out_data, "batch")
+                and out_data.batch is not None
+            ):
+                existing = [
+                    f for f in writeback_fields if f in out_data.batch.keys()
+                ]
+                if existing:
+                    _kv_put(kv_meta, out_data, field_keys=existing)
+                    for f in existing:
+                        if kv_meta.fields is not None and f not in kv_meta.fields:
+                            kv_meta.fields.append(f)
+                    logger.info(
+                        f"[TQ] @kv_tqbridge [{func.__name__}] wrote back "
+                        f"fields={existing} to TQ"
+                    )
+
+            # --- Sync meta_info back to extra_info ---
+            if hasattr(out_data, "meta_info") and out_data.meta_info:
+                if kv_meta.extra_info is None:
+                    kv_meta.extra_info = {}
+                kv_meta.extra_info.update(out_data.meta_info)
+
+            if rest is not None:
+                return (kv_meta, *rest)
+            return kv_meta
+
+        return inner
+
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# @tqbridge decorator — for distributed worker methods accepting BatchMeta
 # ---------------------------------------------------------------------------
 
 def tqbridge(dispatch_mode=None):
