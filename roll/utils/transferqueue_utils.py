@@ -25,10 +25,9 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 from tensordict import TensorDict
 
-from roll.distributed.scheduler.protocol import DataProto
-
 if TYPE_CHECKING:
     from roll.distributed.scheduler.decorator import Dispatch
+    from roll.distributed.scheduler.protocol import DataProto
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("ROLL_LOGGING_LEVEL", "WARN"))
@@ -106,14 +105,16 @@ def _meta_to_realdata(meta) -> TensorDict:
     return _run_async_in_temp_loop(_async_meta_to_realdata, meta)
 
 
-def _meta_to_dataproto(meta) -> DataProto:
+def _meta_to_dataproto(meta) -> "DataProto":
     """Convert BatchMeta to DataProto by fetching TensorDict from TQ."""
+    from roll.distributed.scheduler.protocol import DataProto
     td = _meta_to_realdata(meta)
     extra = copy.deepcopy(meta.extra_info) if meta.extra_info else {}
     return DataProto(batch=td, meta_info=extra)
 
 
-async def _async_meta_to_dataproto(meta) -> DataProto:
+async def _async_meta_to_dataproto(meta) -> "DataProto":
+    from roll.distributed.scheduler.protocol import DataProto
     td = await _async_meta_to_realdata(meta)
     extra = copy.deepcopy(meta.extra_info) if meta.extra_info else {}
     return DataProto(batch=td, meta_info=extra)
@@ -165,6 +166,7 @@ def _compute_need_collect(dispatch_mode, args: list) -> bool:
 
 def _extract_writable_tensordict(output):
     """Extract a non-empty TensorDict from output (DataProto or TensorDict)."""
+    from roll.distributed.scheduler.protocol import DataProto
     if isinstance(output, DataProto):
         if output.batch is not None and output.batch.batch_size and output.batch.batch_size[0] > 0:
             return output.batch
@@ -178,6 +180,7 @@ def _extract_writable_tensordict(output):
 
 def _postprocess_common(output, put_data, need_collect):
     """Normalize return values when TQ bridge decides not to collect."""
+    from roll.distributed.scheduler.protocol import DataProto
     _, BatchMeta, _ = _ensure_tq_imports()
     if put_data and not need_collect:
         return BatchMeta()
