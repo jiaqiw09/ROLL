@@ -778,7 +778,12 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         assert collect_data_num == len(finished_items)
         logger.info(f"total collect data: {collect_data_num}, collect queries: {query_use_count}")
 
+        all_domain_batches_lazy = all(isinstance(domain_batch, LazyDataProto) for domain_batch in collect_data_by_domain.values())
         batch = BatchData(list(collect_data_by_domain.values())).concat()
+        if all_domain_batches_lazy:
+            assert isinstance(
+                batch, LazyDataProto
+            ), "collect_items_as_batch should preserve LazyDataProto when all domain batches are lazy-backed"
         log_dataflow("generate_scheduler.collect.final_batch", batch)
         # TODO support response_filter_count and query_filter_count
         batch.meta_info.setdefault("metrics", {}).update({
