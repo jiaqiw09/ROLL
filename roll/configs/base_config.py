@@ -14,6 +14,32 @@ from roll.utils.logging import get_logger
 logger = get_logger()
 
 @dataclass
+class TransferQueueStorageConfig:
+    """Backend configuration for TransferQueue storage."""
+    storage_backend: str = field(
+        default="SimpleStorage",
+        metadata={"help": "Storage backend type for TransferQueue."}
+    )
+    SimpleStorage: Dict = field(
+        default_factory=lambda: {"total_storage_size": 100000, "num_data_storage_units": 8},
+        metadata={"help": "SimpleStorage configuration."}
+    )
+
+
+@dataclass
+class TransferQueueConfig:
+    """Configuration for TransferQueue integration."""
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable TransferQueue for data transfer."}
+    )
+    backend: TransferQueueStorageConfig = field(
+        default_factory=TransferQueueStorageConfig,
+        metadata={"help": "TransferQueue backend configuration."}
+    )
+
+
+@dataclass
 class RolloutMockConfig:
     """Configuration for rollout dump/mock mechanism for precision alignment testing."""
     enable: bool = field(
@@ -185,6 +211,10 @@ class BaseConfig(ScheduleConfig):
     profiler_timeline: bool = field(default=False, metadata={"help": "Whether to use profiler mode or not."})
     profiler_memory: bool = field(default=False, metadata={"help": "Whether to use profiler memory or not."})
     report_length_and_rewards: bool = field(default=False, metadata={"help": "Whether to report lengths and rewards of prompts in each epoch."})
+    transfer_queue: TransferQueueConfig = field(
+        default_factory=TransferQueueConfig,
+        metadata={"help": "TransferQueue configuration for async data transfer."}
+    )
 
     is_offload_states: bool = field(
         default=False,

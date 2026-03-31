@@ -18,10 +18,11 @@ from transformers import set_seed
 
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.router import RouterManager
-from roll.distributed.scheduler.protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
+from roll.distributed.scheduler.protocol import BatchData, DataProto, LazyDataProto, pad_dataproto_to_divisor, unpad_dataproto
 from roll.distributed.scheduler.reward_scheduler import RewardScheduler
 from roll.distributed.scheduler.rollout_mock_mixin import RolloutMockMixin
 from roll.models.model_providers import default_tokenizer_provider, default_processor_provider
+from roll.utils.transferqueue_utils import dataproto_to_kv_batch_meta, init_tq
 from roll.utils.taskgroups import TaskGroup # TODO use official TaskGroup after upgrade to python 3.11
 from roll.utils.metrics.metrics_manager import DurationTracker
 from roll.utils.import_utils import safe_import_class
@@ -74,6 +75,71 @@ class ExperienceItem:
     domain: str = "default"
     sampling_start_step: Optional[int] = None
     data: Optional[DataProto] = None
+
+
+def _slice_non_tensor_batch(non_tensor_batch: Dict[str, np.ndarray], idx: int) -> Dict[str, np.ndarray]:
+    return {
+        key: np.array([val[idx]], dtype=object)
+        for key, val in (non_tensor_batch or {}).items()
+    }
+
+
+def _commit_responses_to_replay(
+    scheduler: "DynamicSamplingScheduler",
+    prompt_id: int,
+    domain: str,
+    sampling_start_step: int,
+    responses: List[DataProto],
+):
+    if not scheduler.tq_enabled:
+        scheduler.replay_buffer.commit(
+            prompt_id,
+            [
+                ExperienceItem(
+                    prompt_id=prompt_id,
+                    domain=domain,
+                    sampling_start_step=sampling_start_step,
+                    data=response,
+                )
+                for response in responses
+            ],
+        )
+        return
+
+    combined = BatchData(responses).concat() if len(responses) > 1 else responses[0]
+    tags = [{"domain": domain} for _ in range(len(combined))]
+    kv_meta = dataproto_to_kv_batch_meta(
+        combined,
+        partition_id="train",
+        tags=tags,
+    )
+
+    tensor_field_names = list(kv_meta.fields or [])
+    items = []
+    for idx in range(len(combined)):
+        sample_kv_meta = type(kv_meta)(
+            keys=[kv_meta.keys[idx]],
+            tags=[kv_meta.tags[idx]],
+            partition_id=kv_meta.partition_id,
+            fields=list(tensor_field_names),
+            extra_info=copy.deepcopy(combined.meta_info),
+        )
+        sample_data = LazyDataProto.from_kv_batch_meta(
+            sample_kv_meta,
+            tensor_field_names=tensor_field_names,
+            non_tensor_batch=_slice_non_tensor_batch(combined.non_tensor_batch, idx),
+            meta_info=combined.meta_info,
+        )
+        items.append(
+            ExperienceItem(
+                prompt_id=prompt_id,
+                domain=domain,
+                sampling_start_step=sampling_start_step,
+                data=sample_data,
+            )
+        )
+
+    scheduler.replay_buffer.commit(prompt_id, items)
 
 
 class ItemsGroup:
@@ -512,6 +578,12 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         self.udrl = udrl_cls()
 
         self.reward_scheduler = RewardScheduler()
+        self.tq_enabled = (
+            getattr(pipeline_config, "transfer_queue", None) is not None
+            and pipeline_config.transfer_queue.enable
+        )
+        if self.tq_enabled:
+            init_tq(pipeline_config.transfer_queue)
 
     async def initialize(self):
         await self.router_manager.initialize()
@@ -666,7 +738,8 @@ class DynamicSamplingScheduler(RolloutMockMixin):
             batch.meta_info["metrics"].update(metrics)
 
         # DUMP MODE: Save merged batch (from mixin)
-        await self._maybe_dump_batch(batch, global_step)
+        if not self.tq_enabled:
+            await self._maybe_dump_batch(batch, global_step)
 
         return batch
 
@@ -681,14 +754,14 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         data_off_policy_step = data_off_policy_step / len(finished_items)
 
         collect_data_by_domain = {
-            domain: DataProto.concat(data_list) for domain, data_list in collect_data_by_domain.items()
+            domain: BatchData(data_list).concat() for domain, data_list in collect_data_by_domain.items()
         }
         query_use_count = len(prompt_ids)
-        collect_data_num = sum(data.batch.batch_size[0] for data in collect_data_by_domain.values())
+        collect_data_num = sum(len(data) for data in collect_data_by_domain.values())
         assert collect_data_num == len(finished_items)
         logger.info(f"total collect data: {collect_data_num}, collect queries: {query_use_count}")
 
-        batch = DataProto.concat(list(collect_data_by_domain.values()))
+        batch = BatchData(list(collect_data_by_domain.values())).concat()
         # TODO support response_filter_count and query_filter_count
         batch.meta_info.setdefault("metrics", {}).update({
             f"scheduler/collect_query_count": query_use_count,
@@ -783,17 +856,12 @@ class RolloutContext:
                 scheduler.replay_buffer.abort(prompt_id)
             else:
                 assert context.sampling_start_step is not None
-                scheduler.replay_buffer.commit(
-                    prompt_id,
-                    [
-                        ExperienceItem(
-                            prompt_id=prompt_id,
-                            domain=context.domain,
-                            sampling_start_step=context.sampling_start_step,
-                            data=response,
-                        )
-                        for response in responses
-                    ],
+                _commit_responses_to_replay(
+                    scheduler=scheduler,
+                    prompt_id=prompt_id,
+                    domain=context.domain,
+                    sampling_start_step=context.sampling_start_step,
+                    responses=responses,
                 )
 
     def __init__(

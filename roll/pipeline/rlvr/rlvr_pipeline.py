@@ -23,7 +23,7 @@ from roll.distributed.executor.cluster import Cluster
 from roll.configs.base_config import RouterArguments
 from roll.distributed.scheduler.generate_scheduler import DynamicSamplingScheduler
 from roll.distributed.scheduler.router import RouterManager
-from roll.distributed.scheduler.protocol import DataProto
+from roll.distributed.scheduler.protocol import BatchData, DataProto
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.utils.constants import RAY_NAMESPACE
@@ -518,7 +518,7 @@ class RLVRPipeline(BasePipeline):
                             domain, reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         )
                         domain_batches[domain] = domain_batch
-                    generate_output = DataProto.concat([domain_batch for domain_batch in domain_batches.values()])
+                    generate_output = BatchData([domain_batch for domain_batch in domain_batches.values()]).concat()
                     dump_rollout_to_specific_path(self.pipeline_config.rollout_dump_dir, global_step, generate_output, self.tokenizer)
                     generate_output.meta_info.pop("is_offload_states", None)
 
@@ -587,14 +587,14 @@ class RLVRPipeline(BasePipeline):
                             )
                             metrics_mgr.add_metrics(dynamic_batching_metrics)
                         old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
-                        old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                        old_log_probs = BatchData(old_log_probs_refs).concat()
 
                         # Customize_logging metrics, Double check call twice
                         if self.pipeline_config.save_logging_board_dir:
                             old_log_probs_refs2: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
                                 batch, blocking=False
                             )
-                            old_log_probs2 = DataProto.materialize_concat(data_refs=old_log_probs_refs2)
+                            old_log_probs2 = BatchData(old_log_probs_refs2).concat()
                             batch.batch["old_log_probs2"] = old_log_probs2.batch["log_probs"]
                             batch.batch["old_log_probs2_entropy"] = old_log_probs2.batch["entropy"]
 
@@ -612,7 +612,7 @@ class RLVRPipeline(BasePipeline):
                         batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
 
                     if self.pipeline_config.adv_estimator == "gae":
-                        values = DataProto.materialize_concat(data_refs=values_refs)
+                        values = BatchData(values_refs).concat()
                         batch = batch.union(values)
                         metrics_mgr.add_reduced_metrics(values.meta_info.pop("metrics", {}))
 
@@ -669,7 +669,7 @@ class RLVRPipeline(BasePipeline):
                     if self.pipeline_config.save_logging_board_dir:
                         self.save_metrics(domain_batch)
 
-                batch = DataProto.concat(batch_list)
+                batch = BatchData(batch_list).concat()
 
                 if batch.batch["final_response_mask"].sum() == 0:
                     logger.info("Warning: final_response_mask.sum() == 0! Current step will be skipped.")
@@ -731,13 +731,11 @@ class RLVRPipeline(BasePipeline):
                                 )
                                 metrics_mgr.add_metrics(dynamic_batching_metrics)
                             actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
-                            actor_train_metrics: DataProto = DataProto.materialize_concat(
-                                data_refs=actor_train_metrics_refs
-                            )
+                            actor_train_metrics: DataProto = BatchData(actor_train_metrics_refs).concat()
                             metrics_mgr.add_reduced_metrics(actor_train_metrics.meta_info.pop("metrics", {}))
 
                     if self.pipeline_config.adv_estimator == "gae":
-                        critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
+                        critic_train_metrics = BatchData(critic_train_metrics_refs).concat()
                         metrics_mgr.add_reduced_metrics(critic_train_metrics.meta_info.pop("metrics", {}))
 
                 metrics_mgr.add_metric("time/step_train", step_train_timer.last)

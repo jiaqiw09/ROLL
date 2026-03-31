@@ -6,6 +6,7 @@ We can subclass Protocol to define more detailed batch info with specific keys
 
 import copy
 import os
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, Set
@@ -670,6 +671,12 @@ class DataProto:
         """
         global_keys = global_keys if global_keys is not None else {"metrics"}
 
+        lazy_cls = globals().get("LazyDataProto")
+        if lazy_cls is not None and any(isinstance(d, lazy_cls) for d in data):
+            if all(isinstance(d, lazy_cls) for d in data):
+                return lazy_cls.concat(data, global_keys=global_keys)
+            data = [d.materialize() if isinstance(d, lazy_cls) else d for d in data]
+
         # ---------- 1. Concatenate tensor / non-tensor batches ----------
         batch_lst = [d.batch for d in data if d.batch is not None]
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst else None
@@ -837,7 +844,9 @@ class DataProto:
             The concatenated DataProto instance.
         """
         # Normalize input to List[<reference>]
-        if isinstance(data_refs, DataProto):
+        if isinstance(data_refs, (DataProto, LazyDataProto)):
+            data_refs = [data_refs]
+        elif not isinstance(data_refs, (list, tuple)):
             data_refs = [data_refs]
 
         timeout = None
@@ -850,11 +859,419 @@ class DataProto:
             obj_refs = [ref.obj_ref for ref in data_refs]
             fetched = ray.get(obj_refs, timeout=timeout)
             data = [fetched[i] for i, ref in enumerate(data_refs) if ref.collected]
+        elif isinstance(data_refs[0], ray.ObjectRef):
+            data = ray.get(data_refs, timeout=timeout)
         else:
-            data: List["DataProto"] = ray.get(data_refs, timeout=timeout)
+            data = list(data_refs)
+
+        BatchMeta, KVBatchMeta = BatchData._maybe_import_tq_types()
+        if BatchMeta is not None:
+            from roll.utils.transferqueue_utils import meta_to_dataproto
+
+            normalized = []
+            for item in data:
+                if isinstance(item, (BatchMeta, KVBatchMeta)):
+                    normalized.append(meta_to_dataproto(item))
+                elif isinstance(item, LazyDataProto):
+                    normalized.append(item.materialize())
+                else:
+                    normalized.append(item)
+            data = normalized
 
         # Concatenate and apply global aggregation rules
         return DataProto.concat(data, global_keys=global_keys)
+
+
+@dataclass
+class LazyDataProto(DataProto):
+    """A minimal TQ-backed DataProto variant.
+
+    This class keeps the public DataProto surface while delegating actual tensor
+    storage to TransferQueue through KVBatchMeta. For now we only implement the
+    minimum protocol pieces needed by BatchData / dispatch / collect:
+    - `materialize(fields=None)`
+    - `chunk(chunks)`
+    - `concat(data_list)`
+
+    Deeper lazy behaviors such as lazy `group_by/select/reorder` can be added
+    incrementally after the transport path is stable.
+    """
+
+    _kv_meta: Any = field(default=None, repr=False, init=False)
+    _materialized: bool = field(default=True, repr=False, init=False)
+    _tensor_field_names: List[str] = field(default_factory=list, repr=False, init=False)
+    _local_authoritative_fields: Set[str] = field(default_factory=set, repr=False, init=False)
+    _materialize_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, init=False)
+
+    def check_consistency(self):
+        if self.batch is not None:
+            return DataProto.check_consistency(self)
+
+        if len(self.non_tensor_batch) != 0:
+            batch_size = len(next(iter(self.non_tensor_batch.values())))
+            for key, val in self.non_tensor_batch.items():
+                assert (
+                    isinstance(val, np.ndarray) and val.dtype == object
+                ), "data in non_tensor_batch must be numpy.ndarray with dtype=object"
+                assert (
+                    val.shape[0] == batch_size
+                ), f"key {key} length {len(val)} is not equal to batch size {batch_size}"
+
+    def __len__(self):
+        if self.batch is not None:
+            return self.batch.batch_size[0]
+        if self.non_tensor_batch is not None and len(self.non_tensor_batch) > 0:
+            return len(next(iter(self.non_tensor_batch.values())))
+        if self._kv_meta is not None:
+            return len(self._kv_meta.keys)
+        return 0
+
+    def __getattribute__(self, name):
+        if name == "batch":
+            try:
+                kv_meta = object.__getattribute__(self, "_kv_meta")
+                materialized = object.__getattribute__(self, "_materialized")
+                batch = object.__getattribute__(self, "__dict__").get("batch", None)
+                if kv_meta is not None and not materialized and batch is None:
+                    self.materialize()
+            except AttributeError:
+                pass
+        return object.__getattribute__(self, name)
+
+    @classmethod
+    def from_kv_batch_meta(
+        cls,
+        kv_meta,
+        *,
+        tensor_field_names: Optional[List[str]] = None,
+        non_tensor_batch: Optional[Dict] = None,
+        meta_info: Optional[Dict] = None,
+    ) -> "LazyDataProto":
+        instance = cls(
+            batch=None,
+            non_tensor_batch=non_tensor_batch or {},
+            meta_info=copy.deepcopy(meta_info or getattr(kv_meta, "extra_info", {}) or {}),
+        )
+        instance._kv_meta = kv_meta
+        instance._materialized = False
+        instance._tensor_field_names = list(
+            tensor_field_names if tensor_field_names is not None else (getattr(kv_meta, "fields", None) or [])
+        )
+        instance._local_authoritative_fields = set()
+        instance._materialize_lock = threading.Lock()
+        return instance
+
+    def materialize(self, fields: Optional[List[str]] = None) -> "LazyDataProto":
+        if self._kv_meta is None or self._materialized:
+            return self
+
+        with self._materialize_lock:
+            if self._materialized:
+                return self
+
+            import transfer_queue as tq
+
+            tq.init()
+            fetch_fields = fields or self._tensor_field_names or getattr(self._kv_meta, "fields", None)
+            td = tq.kv_batch_get_by_meta(self._kv_meta, select_fields=fetch_fields)
+            current_batch = object.__getattribute__(self, "__dict__").get("batch", None)
+            if current_batch is None:
+                object.__setattr__(self, "batch", td)
+            else:
+                for key in td.keys():
+                    current_batch[key] = td[key]
+            object.__setattr__(self, "_materialized", True)
+        return self
+
+    def set_tensor_field(self, key: str, value: torch.Tensor) -> "LazyDataProto":
+        if self.batch is None:
+            object.__setattr__(self, "batch", TensorDict({}, batch_size=value.shape[:1]))
+        self.batch[key] = value
+        self._local_authoritative_fields.add(key)
+        if key not in self._tensor_field_names:
+            self._tensor_field_names.append(key)
+        return self
+
+    def mark_local_updated(self, fields: Union[str, List[str], Set[str]]) -> "LazyDataProto":
+        if isinstance(fields, str):
+            fields = [fields]
+        self._local_authoritative_fields.update(fields)
+        for field_name in fields:
+            if field_name not in self._tensor_field_names:
+                self._tensor_field_names.append(field_name)
+        return self
+
+    def prepare_for_remote(self, required_fields: Optional[List[str]] = None):
+        """Sync local authoritative tensor fields to TQ before remote worker dispatch.
+
+        Current rule is intentionally simple and correctness-first:
+        - if a required field currently exists in local `batch`, we treat local as authoritative
+        - before dispatch, sync those local fields to TQ
+        - return KVBatchMeta so the worker path can go through `@tqbridge`
+
+        This gives us the right controller/worker boundary behavior first; more
+        selective dirty tracking can be added later.
+        """
+        if self._kv_meta is None:
+            return self
+
+        required_fields = list(required_fields or self._tensor_field_names)
+        local_batch = object.__getattribute__(self, "__dict__").get("batch", None)
+        if local_batch is not None:
+            local_required_fields = [field for field in required_fields if field in local_batch.keys()]
+        else:
+            local_required_fields = []
+
+        if local_required_fields:
+            from roll.utils.transferqueue_utils import kv_batch_meta_put_tensordict
+
+            td = local_batch.select(*local_required_fields)
+            self._kv_meta = kv_batch_meta_put_tensordict(
+                self._kv_meta,
+                td,
+                func_name="LazyDataProto.prepare_for_remote",
+            )
+            self._local_authoritative_fields.difference_update(local_required_fields)
+            for field_name in local_required_fields:
+                if field_name not in self._tensor_field_names:
+                    self._tensor_field_names.append(field_name)
+
+        if hasattr(self._kv_meta, "fields"):
+            self._kv_meta.fields = list(dict.fromkeys(self._tensor_field_names))
+        if hasattr(self._kv_meta, "extra_info"):
+            self._kv_meta.extra_info = {
+                "meta_info": copy.deepcopy(self.meta_info),
+                "non_tensor_batch": copy.deepcopy(self.non_tensor_batch),
+            }
+        return self._kv_meta
+
+    def chunk(self, chunks: int) -> List["DataProto"]:
+        if self._kv_meta is None or self._materialized:
+            return DataProto.chunk(self, chunks)
+
+        from roll.utils.transferqueue_utils import kv_batch_meta2batch_meta, batch_meta2kv_batch_meta
+
+        batch_meta = kv_batch_meta2batch_meta(self._kv_meta)
+        sub_batch_metas = batch_meta.chunk(chunks)
+
+        chunks_sizes = [sub_meta.size for sub_meta in sub_batch_metas]
+        non_tensor_batch_lst = [{} for _ in range(chunks)]
+        for key, val in self.non_tensor_batch.items():
+            split_vals = divide_by_chunk_size(val, chunk_sizes=chunks_sizes)
+            for idx in range(chunks):
+                non_tensor_batch_lst[idx][key] = split_vals[idx]
+
+        outputs = []
+        for idx, sub_batch_meta in enumerate(sub_batch_metas):
+            sub_kv_meta = batch_meta2kv_batch_meta(sub_batch_meta)
+            outputs.append(
+                type(self).from_kv_batch_meta(
+                    sub_kv_meta,
+                    tensor_field_names=list(self._tensor_field_names),
+                    non_tensor_batch=non_tensor_batch_lst[idx],
+                    meta_info=self.meta_info,
+                )
+            )
+        return outputs
+
+    def select_idxs(self, idxs):
+        if self._kv_meta is None or self._materialized:
+            return DataProto.select_idxs(self, idxs)
+
+        if isinstance(idxs, list):
+            idxs = np.array(idxs)
+        elif isinstance(idxs, torch.Tensor):
+            idxs = idxs.detach().cpu().numpy()
+
+        if isinstance(idxs, np.ndarray) and idxs.dtype == bool:
+            selected_idx = np.nonzero(idxs)[0].tolist()
+        elif isinstance(idxs, np.ndarray):
+            selected_idx = idxs.tolist()
+        else:
+            raise TypeError(f"Unsupported idxs type for LazyDataProto.select_idxs: {type(idxs)}")
+
+        kv_meta = copy.deepcopy(self._kv_meta)
+        kv_meta.keys = [kv_meta.keys[i] for i in selected_idx]
+        if getattr(kv_meta, "tags", None) is not None:
+            kv_meta.tags = [kv_meta.tags[i] for i in selected_idx]
+
+        selected_non_tensor = {key: val[selected_idx] for key, val in self.non_tensor_batch.items()}
+        return type(self).from_kv_batch_meta(
+            kv_meta,
+            tensor_field_names=list(self._tensor_field_names),
+            non_tensor_batch=selected_non_tensor,
+            meta_info=self.meta_info,
+        )
+
+    def slice(self, start=None, end=None, step=None):
+        if self._kv_meta is None or self._materialized:
+            return DataProto.slice(self, start, end, step)
+        indices = np.arange(len(self))[slice(start, end, step)]
+        return self.select_idxs(indices)
+
+    def reorder(self, indices):
+        if self._kv_meta is None or self._materialized:
+            return DataProto.reorder(self, indices)
+
+        indices = indices.view(-1) if isinstance(indices, torch.Tensor) and indices.dim() == 0 else indices
+        if isinstance(indices, torch.Tensor):
+            indices_np = indices.detach().cpu().numpy()
+        else:
+            indices_np = np.asarray(indices)
+        order = indices_np.tolist()
+
+        self._kv_meta.keys = [self._kv_meta.keys[i] for i in order]
+        if getattr(self._kv_meta, "tags", None) is not None:
+            self._kv_meta.tags = [self._kv_meta.tags[i] for i in order]
+        self.non_tensor_batch = {key: val[indices_np] for key, val in self.non_tensor_batch.items()}
+        return self
+
+    def group_by(self, keys: Union[List[str], str]) -> Dict[str, "DataProto"]:
+        if self._kv_meta is None or self._materialized:
+            return DataProto.group_by(self, keys)
+
+        keys = self.validate_input(keys)
+        assert len(keys) > 0, "Must provide at least one grouping key"
+        if not all(key in self.non_tensor_batch for key in keys):
+            self.materialize()
+            return DataProto.group_by(self, keys)
+
+        groups = defaultdict(list)
+        for idx in range(len(self)):
+            key_values = [str(self.non_tensor_batch[key][idx]) for key in keys]
+            group_key = "|".join(key_values) if len(key_values) > 1 else key_values[0]
+            groups[group_key].append(idx)
+
+        return {group_key: self.select_idxs(indices) for group_key, indices in groups.items()}
+
+    @staticmethod
+    def concat(
+        data: List["DataProto"],
+        *,
+        global_keys: Optional[Set[str]] = None,
+    ) -> "DataProto":
+        if not data:
+            raise ValueError("Cannot concatenate an empty list.")
+
+        all_lazy = all(
+            isinstance(item, LazyDataProto) and item._kv_meta is not None and not item._materialized
+            for item in data
+        )
+        if not all_lazy:
+            eager_data = [item.materialize() if isinstance(item, LazyDataProto) else item for item in data]
+            return DataProto.concat(eager_data, global_keys=global_keys)
+
+        from roll.utils.transferqueue_utils import kv_batch_meta2batch_meta, batch_meta2kv_batch_meta
+
+        batch_meta = type(kv_batch_meta2batch_meta(data[0]._kv_meta)).concat(
+            [kv_batch_meta2batch_meta(item._kv_meta) for item in data]
+        )
+        merged_kv_meta = batch_meta2kv_batch_meta(batch_meta)
+
+        merged_non_tensor = list_of_dict_to_dict_of_list([item.non_tensor_batch for item in data])
+        for key, val in merged_non_tensor.items():
+            merged_non_tensor[key] = custom_np_concatenate(val)
+
+        merged_meta = DataProto.concat([DataProto(batch=None, non_tensor_batch={}, meta_info=item.meta_info) for item in data], global_keys=global_keys).meta_info
+        tensor_field_names = list(getattr(merged_kv_meta, "fields", None) or getattr(data[0], "_tensor_field_names", []))
+
+        return LazyDataProto.from_kv_batch_meta(
+            merged_kv_meta,
+            tensor_field_names=tensor_field_names,
+            non_tensor_batch=merged_non_tensor,
+            meta_info=merged_meta,
+        )
+
+
+class BatchData:
+    """A thin protocol wrapper for dispatch/collect operations.
+
+    This keeps Cluster/decorator code agnostic to whether the payload is a
+    DataProto, TensorDict, BatchMeta, or KVBatchMeta.
+    """
+
+    def __init__(self, data):
+        self._data = data
+
+    @staticmethod
+    def _maybe_import_tq_types():
+        try:
+            from transfer_queue import BatchMeta, KVBatchMeta
+            return BatchMeta, KVBatchMeta
+        except ImportError:
+            return None, None
+
+    def is_chunkable(self) -> bool:
+        data = self._data
+        BatchMeta, KVBatchMeta = self._maybe_import_tq_types()
+        supported = [DataProto, LazyDataProto, TensorDict]
+        if BatchMeta is not None:
+            supported.extend([BatchMeta, KVBatchMeta])
+        return isinstance(data, tuple(supported))
+
+    def is_concatable(self) -> bool:
+        data = self._data
+        if not isinstance(data, (list, tuple)) or len(data) == 0:
+            return False
+        sample = data[0]
+        BatchMeta, KVBatchMeta = self._maybe_import_tq_types()
+        supported = [DataProto, LazyDataProto, ray.ObjectRef, TensorDict, ObjectRefWrap]
+        if BatchMeta is not None:
+            supported.extend([BatchMeta, KVBatchMeta])
+        return isinstance(sample, tuple(supported))
+
+    def chunk(self, chunks: int):
+        data = self._data
+        BatchMeta, KVBatchMeta = self._maybe_import_tq_types()
+
+        if isinstance(data, (DataProto, LazyDataProto)):
+            return data.chunk(chunks=chunks)
+
+        if isinstance(data, TensorDict):
+            if len(data) == 0:
+                return tuple(TensorDict({}, batch_size=(0,)) for _ in range(chunks))
+            index_array = np.arange(len(data))
+            chunk_sizes = [len(b) for b in np.array_split(index_array, chunks)]
+            raw_chunks = divide_by_chunk_size(data, chunk_sizes=chunk_sizes)
+            return tuple(chunk.clone() for chunk in raw_chunks)
+
+        if BatchMeta is not None and isinstance(data, KVBatchMeta):
+            from roll.utils.transferqueue_utils import kv_batch_meta2batch_meta
+
+            data = kv_batch_meta2batch_meta(data)
+
+        return data.chunk(chunks=chunks)
+
+    def concat(self):
+        data = self._data
+        if not data:
+            raise ValueError("Cannot concatenate an empty list of data items.")
+
+        sample = data[0]
+        BatchMeta, KVBatchMeta = self._maybe_import_tq_types()
+
+        if isinstance(sample, (DataProto, LazyDataProto)):
+            return DataProto.concat(data)
+
+        if isinstance(sample, (ray.ObjectRef, ObjectRefWrap)):
+            return DataProto.materialize_concat(data)
+
+        if isinstance(sample, TensorDict):
+            return torch.cat(data, dim=0)
+
+        if BatchMeta is not None and isinstance(sample, BatchMeta):
+            batch_meta = BatchMeta.concat(data)
+            from roll.utils.transferqueue_utils import batch_meta2kv_batch_meta
+
+            return batch_meta2kv_batch_meta(batch_meta)
+
+        raise TypeError(f"Unsupported concat sample type: {type(sample)}")
+
+    def prepare_for_remote(self, required_fields: Optional[List[str]] = None):
+        data = self._data
+        if isinstance(data, LazyDataProto):
+            return data.prepare_for_remote(required_fields=required_fields)
+        return data
 
 
 class ObjectRefWrap:
