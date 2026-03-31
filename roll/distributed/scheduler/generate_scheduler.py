@@ -18,7 +18,14 @@ from transformers import set_seed
 
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.router import RouterManager
-from roll.distributed.scheduler.protocol import BatchData, DataProto, LazyDataProto, pad_dataproto_to_divisor, unpad_dataproto
+from roll.distributed.scheduler.protocol import (
+    BatchData,
+    DataProto,
+    LazyDataProto,
+    log_dataflow,
+    pad_dataproto_to_divisor,
+    unpad_dataproto,
+)
 from roll.distributed.scheduler.reward_scheduler import RewardScheduler
 from roll.distributed.scheduler.rollout_mock_mixin import RolloutMockMixin
 from roll.models.model_providers import default_tokenizer_provider, default_processor_provider
@@ -107,12 +114,14 @@ def _commit_responses_to_replay(
         return
 
     combined = BatchData(responses).concat() if len(responses) > 1 else responses[0]
+    log_dataflow("generate_scheduler.commit_to_replay.combined", combined, domain=domain, prompt_id=prompt_id)
     tags = [{"domain": domain} for _ in range(len(combined))]
     kv_meta = dataproto_to_kv_batch_meta(
         combined,
         partition_id="train",
         tags=tags,
     )
+    log_dataflow("generate_scheduler.commit_to_replay.kv_meta", kv_meta, domain=domain, prompt_id=prompt_id)
 
     tensor_field_names = list(kv_meta.fields or [])
     items = []
@@ -122,7 +131,12 @@ def _commit_responses_to_replay(
             tags=[kv_meta.tags[idx]],
             partition_id=kv_meta.partition_id,
             fields=list(tensor_field_names),
-            extra_info=copy.deepcopy(combined.meta_info),
+            #extra_info=copy.deepcopy(combined.meta_info),
+            # Replay-side LazyDataProto keeps per-sample meta_info/non-tensor data
+            # on the object itself. Keep KV meta extra_info merge-safe so later
+            # lazy concat does not try to merge sample-private fields such as
+            # output_logprobs.
+            extra_info={},
         )
         sample_data = LazyDataProto.from_kv_batch_meta(
             sample_kv_meta,
@@ -130,6 +144,7 @@ def _commit_responses_to_replay(
             non_tensor_batch=_slice_non_tensor_batch(combined.non_tensor_batch, idx),
             meta_info=combined.meta_info,
         )
+        log_dataflow("generate_scheduler.commit_to_replay.sample", sample_data, domain=domain, prompt_id=prompt_id, sample_idx=idx)
         items.append(
             ExperienceItem(
                 prompt_id=prompt_id,
@@ -756,12 +771,15 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         collect_data_by_domain = {
             domain: BatchData(data_list).concat() for domain, data_list in collect_data_by_domain.items()
         }
+        for domain, domain_batch in collect_data_by_domain.items():
+            log_dataflow("generate_scheduler.collect.domain_batch", domain_batch, domain=domain)
         query_use_count = len(prompt_ids)
         collect_data_num = sum(len(data) for data in collect_data_by_domain.values())
         assert collect_data_num == len(finished_items)
         logger.info(f"total collect data: {collect_data_num}, collect queries: {query_use_count}")
 
         batch = BatchData(list(collect_data_by_domain.values())).concat()
+        log_dataflow("generate_scheduler.collect.final_batch", batch)
         # TODO support response_filter_count and query_filter_count
         batch.meta_info.setdefault("metrics", {}).update({
             f"scheduler/collect_query_count": query_use_count,
@@ -771,6 +789,8 @@ class DynamicSamplingScheduler(RolloutMockMixin):
 
         metrics = {}
         for domain, response_batch in collect_data_by_domain.items():
+            if isinstance(response_batch, LazyDataProto):
+                response_batch.materialize(fields=["scores"])
             sequence_score = response_batch.batch["scores"]
             metrics[f"scheduler/{domain}/score/mean"] = torch.mean(sequence_score).detach().item()
             metrics[f"scheduler/{domain}/score/max"] = torch.max(sequence_score).detach().item()

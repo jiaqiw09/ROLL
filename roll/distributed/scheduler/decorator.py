@@ -12,7 +12,7 @@ import ray
 import torch
 import asyncio
 
-from roll.distributed.scheduler.protocol import DataProto, ObjectRefWrap, BatchData
+from roll.distributed.scheduler.protocol import DataProto, ObjectRefWrap, BatchData, log_dataflow
 from roll.utils.logging import get_logger
 from roll.platforms import current_platform
 
@@ -45,6 +45,8 @@ def _split_args_kwargs(chunks, *args, **kwargs):
     """
     splitted_args = [BatchData(arg).chunk(chunks) for arg in args]
     splitted_kwargs = {key: BatchData(val).chunk(chunks) for key, val in kwargs.items()}
+    log_dataflow("decorator.split_args", splitted_args, chunks=chunks)
+    log_dataflow("decorator.split_kwargs", list(splitted_kwargs.values()), chunks=chunks, keys=list(splitted_kwargs.keys()))
     return splitted_args, splitted_kwargs
 
 
@@ -106,7 +108,24 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
             and not (rank_info.tp_rank == 0 and rank_info.cp_rank == 0 and rank_info.pp_rank == 0)
         ):
             value = DataProto(batch=None, meta_info=value.meta_info)
-        return BatchData(value).prepare_for_remote()
+        log_dataflow(
+            "decorator.prepare_for_remote.input",
+            value,
+            dp_rank=local_dp_rank,
+            tp_rank=rank_info.tp_rank,
+            pp_rank=rank_info.pp_rank,
+            cp_rank=rank_info.cp_rank,
+        )
+        result = BatchData(value).prepare_for_remote()
+        log_dataflow(
+            "decorator.prepare_for_remote.output",
+            result,
+            dp_rank=local_dp_rank,
+            tp_rank=rank_info.tp_rank,
+            pp_rank=rank_info.pp_rank,
+            cp_rank=rank_info.cp_rank,
+        )
+        return result
 
     for arg in splitted_args:
         assert isinstance(arg, (Tuple, List)) and len(arg) == cluster.dp_size
@@ -161,7 +180,10 @@ def collect_dp_mp_compute(cluster, output):
         if local_rank_info.tp_rank == 0 and local_rank_info.is_pipeline_last_stage and local_rank_info.cp_rank == 0:
             output_in_dp.append(output[global_rank])
 
-    return BatchData(output_in_dp).concat()
+    log_dataflow("decorator.collect_dp_mp_compute.input", output_in_dp)
+    result = BatchData(output_in_dp).concat()
+    log_dataflow("decorator.collect_dp_mp_compute.output", result)
+    return result
 
 
 predefined_dispatch_mode_fn = {

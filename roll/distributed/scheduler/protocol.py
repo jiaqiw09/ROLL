@@ -30,6 +30,105 @@ except:
     pass
 
 
+def _maybe_import_tq_types():
+    try:
+        from transfer_queue import BatchMeta, KVBatchMeta
+        return BatchMeta, KVBatchMeta
+    except Exception:
+        return None, None
+
+
+def dataflow_debug_enabled() -> bool:
+    return os.getenv("ROLL_DEBUG_DATA_FLOW", "1").lower() not in {"0", "false", "off", "no"}
+
+
+def _short_list(values, limit: int = 8) -> str:
+    values = list(values)
+    if len(values) <= limit:
+        return str(values)
+    return f"{values[:limit]}...(+{len(values) - limit})"
+
+
+def describe_dataflow(data) -> str:
+    BatchMeta, KVBatchMeta = _maybe_import_tq_types()
+
+    if data is None:
+        return "None"
+
+    if isinstance(data, ray.ObjectRef):
+        return "ObjectRef"
+
+    if isinstance(data, (list, tuple)):
+        sample_types = [type(item).__name__ for item in data[:5]]
+        suffix = "" if len(data) <= 5 else f", +{len(data) - 5} more"
+        return f"{type(data).__name__}(len={len(data)}, sample_types={sample_types}{suffix})"
+
+    if isinstance(data, TensorDict):
+        return f"TensorDict(batch_size={tuple(data.batch_size)}, keys={_short_list(data.keys())})"
+
+    if BatchMeta is not None and isinstance(data, BatchMeta):
+        field_names = list(getattr(data, "field_names", []) or [])
+        extra_info = getattr(data, "extra_info", None) or {}
+        return (
+            f"BatchMeta(size={getattr(data, 'size', '?')}, "
+            f"fields={_short_list(field_names)}, "
+            f"extra_keys={_short_list(extra_info.keys())})"
+        )
+
+    if KVBatchMeta is not None and isinstance(data, KVBatchMeta):
+        fields = list(getattr(data, "fields", []) or [])
+        extra_info = getattr(data, "extra_info", None) or {}
+        return (
+            f"KVBatchMeta(keys={len(getattr(data, 'keys', []) or [])}, "
+            f"partition_id={getattr(data, 'partition_id', None)}, "
+            f"fields={_short_list(fields)}, "
+            f"extra_keys={_short_list(extra_info.keys())})"
+        )
+
+    if isinstance(data, DataProto):
+        raw_dict = object.__getattribute__(data, "__dict__")
+        batch = raw_dict.get("batch", None)
+        non_tensor_batch = getattr(data, "non_tensor_batch", {}) or {}
+        meta_info = getattr(data, "meta_info", {}) or {}
+        parts = [
+            type(data).__name__,
+            f"len={len(data)}",
+            f"batch={'set' if batch is not None else 'none'}",
+            f"tensor_keys={_short_list(batch.keys() if batch is not None else [])}",
+            f"non_tensor_keys={_short_list(non_tensor_batch.keys())}",
+            f"meta_keys={_short_list(meta_info.keys())}",
+        ]
+        if isinstance(data, globals().get("LazyDataProto", ())):
+            kv_meta = raw_dict.get("_kv_meta", None)
+            parts.extend([
+                f"lazy_backed={kv_meta is not None}",
+                f"materialized={raw_dict.get('_materialized', None)}",
+                f"local_authoritative={_short_list(raw_dict.get('_local_authoritative_fields', []))}",
+            ])
+            if kv_meta is not None:
+                parts.extend([
+                    f"kv_partition={getattr(kv_meta, 'partition_id', None)}",
+                    f"kv_key_count={len(getattr(kv_meta, 'keys', []) or [])}",
+                    f"kv_fields={_short_list(getattr(kv_meta, 'fields', []) or [])}",
+                ])
+        return ", ".join(parts)
+
+    if type(data).__name__ == "ObjectRefWrap":
+        return f"ObjectRefWrap(collected={getattr(data, 'collected', None)})"
+
+    return type(data).__name__
+
+
+def log_dataflow(event: str, data=None, **context):
+    if not dataflow_debug_enabled():
+        return
+    ctx = " ".join(f"{key}={value}" for key, value in context.items() if value is not None)
+    prefix = f"[dataflow][{event}]"
+    if ctx:
+        prefix = f"{prefix} {ctx}"
+    logger.info(f"{prefix} {describe_dataflow(data)}")
+
+
 def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
     """Pad a DataProto to size divisible by size_divisor
 
@@ -670,12 +769,27 @@ class DataProto:
             and processed meta information.
         """
         global_keys = global_keys if global_keys is not None else {"metrics"}
+        log_dataflow("protocol.dataproto.concat.enter", data, global_keys=sorted(global_keys))
 
         lazy_cls = globals().get("LazyDataProto")
+
+        def _as_eager_dataproto(item):
+            if lazy_cls is not None and isinstance(item, lazy_cls):
+                item = item.materialize()
+                return DataProto(
+                    batch=item.batch,
+                    non_tensor_batch=item.non_tensor_batch,
+                    meta_info=item.meta_info,
+                )
+            return item
+
         if lazy_cls is not None and any(isinstance(d, lazy_cls) for d in data):
             if all(isinstance(d, lazy_cls) for d in data):
+                log_dataflow("protocol.dataproto.concat.delegate_lazy", data)
                 return lazy_cls.concat(data, global_keys=global_keys)
-            data = [d.materialize() if isinstance(d, lazy_cls) else d for d in data]
+            #data = [d.materialize() if isinstance(d, lazy_cls) else d for d in data]
+            data = [_as_eager_dataproto(d) for d in data]
+            log_dataflow("protocol.dataproto.concat.normalized_eager", data)
 
         # ---------- 1. Concatenate tensor / non-tensor batches ----------
         batch_lst = [d.batch for d in data if d.batch is not None]
@@ -714,11 +828,13 @@ class DataProto:
             else:
                 merged_meta[key] = values
 
-        return DataProto(
+        result = DataProto(
             batch=new_batch,
             non_tensor_batch=non_tensor_batch,
             meta_info=merged_meta,
         )
+        log_dataflow("protocol.dataproto.concat.exit", result)
+        return result
 
     def reorder(self, indices):
         """
@@ -843,6 +959,11 @@ class DataProto:
         DataProto
             The concatenated DataProto instance.
         """
+        log_dataflow(
+            "protocol.dataproto.materialize_concat.enter",
+            data_refs,
+            global_keys=sorted(global_keys or {"metrics"}),
+        )
         # Normalize input to List[<reference>]
         if isinstance(data_refs, (DataProto, LazyDataProto)):
             data_refs = [data_refs]
@@ -879,7 +1000,9 @@ class DataProto:
             data = normalized
 
         # Concatenate and apply global aggregation rules
-        return DataProto.concat(data, global_keys=global_keys)
+        result = DataProto.concat(data, global_keys=global_keys)
+        log_dataflow("protocol.dataproto.materialize_concat.exit", result)
+        return result
 
 
 @dataclass
@@ -973,7 +1096,12 @@ class LazyDataProto(DataProto):
 
             tq.init()
             fetch_fields = fields or self._tensor_field_names or getattr(self._kv_meta, "fields", None)
-            td = tq.kv_batch_get_by_meta(self._kv_meta, select_fields=fetch_fields)
+            log_dataflow("protocol.lazy.materialize.enter", self, fields=fetch_fields)
+            td = tq.kv_batch_get(
+                    keys=self._kv_meta.keys,
+                    partition_id=self._kv_meta.partition_id,
+                    fields=fetch_fields,
+                )
             current_batch = object.__getattribute__(self, "__dict__").get("batch", None)
             if current_batch is None:
                 object.__setattr__(self, "batch", td)
@@ -981,6 +1109,7 @@ class LazyDataProto(DataProto):
                 for key in td.keys():
                     current_batch[key] = td[key]
             object.__setattr__(self, "_materialized", True)
+            log_dataflow("protocol.lazy.materialize.exit", self, fields=fetch_fields)
         return self
 
     def set_tensor_field(self, key: str, value: torch.Tensor) -> "LazyDataProto":
@@ -1016,6 +1145,7 @@ class LazyDataProto(DataProto):
             return self
 
         required_fields = list(required_fields or self._tensor_field_names)
+        log_dataflow("protocol.lazy.prepare_for_remote.enter", self, required_fields=required_fields)
         local_batch = object.__getattribute__(self, "__dict__").get("batch", None)
         if local_batch is not None:
             local_required_fields = [field for field in required_fields if field in local_batch.keys()]
@@ -1043,6 +1173,7 @@ class LazyDataProto(DataProto):
                 "meta_info": copy.deepcopy(self.meta_info),
                 "non_tensor_batch": copy.deepcopy(self.non_tensor_batch),
             }
+        log_dataflow("protocol.lazy.prepare_for_remote.exit", self._kv_meta, required_fields=required_fields)
         return self._kv_meta
 
     def chunk(self, chunks: int) -> List["DataProto"]:
@@ -1142,7 +1273,9 @@ class LazyDataProto(DataProto):
             group_key = "|".join(key_values) if len(key_values) > 1 else key_values[0]
             groups[group_key].append(idx)
 
-        return {group_key: self.select_idxs(indices) for group_key, indices in groups.items()}
+        outputs = {group_key: self.select_idxs(indices) for group_key, indices in groups.items()}
+        log_dataflow("protocol.lazy.group_by.exit", list(outputs.values()), keys=keys, groups=list(outputs.keys()))
+        return outputs
 
     @staticmethod
     def concat(
@@ -1152,19 +1285,41 @@ class LazyDataProto(DataProto):
     ) -> "DataProto":
         if not data:
             raise ValueError("Cannot concatenate an empty list.")
+        log_dataflow("protocol.lazy.concat.enter", data, global_keys=sorted(global_keys or {"metrics"}))
 
         all_lazy = all(
             isinstance(item, LazyDataProto) and item._kv_meta is not None and not item._materialized
             for item in data
         )
         if not all_lazy:
-            eager_data = [item.materialize() if isinstance(item, LazyDataProto) else item for item in data]
+            #eager_data = [item.materialize() if isinstance(item, LazyDataProto) else item for item in data]
+            eager_data = [
+                DataProto(
+                    batch=item.materialize().batch,
+                    non_tensor_batch=item.non_tensor_batch,
+                    meta_info=item.meta_info,
+                ) if isinstance(item, LazyDataProto) else item
+                for item in data
+            ]
+            log_dataflow("protocol.lazy.concat.fallback_eager", eager_data)
             return DataProto.concat(eager_data, global_keys=global_keys)
 
         from roll.utils.transferqueue_utils import kv_batch_meta2batch_meta, batch_meta2kv_batch_meta
 
-        batch_meta = type(kv_batch_meta2batch_meta(data[0]._kv_meta)).concat(
-            [kv_batch_meta2batch_meta(item._kv_meta) for item in data]
+        # batch_meta = type(kv_batch_meta2batch_meta(data[0]._kv_meta)).concat(
+        #             [kv_batch_meta2batch_meta(item._kv_meta) for item in data]
+        def _concat_safe_batch_meta(kv_meta):
+            kv_meta = copy.deepcopy(kv_meta)
+            if hasattr(kv_meta, "extra_info"):
+                # LazyDataProto already carries authoritative meta_info and
+                # non_tensor_batch locally. Stripping extra_info here prevents
+                # BatchMeta.concat from treating sample-private generation data
+                # as batch-global metadata.
+                kv_meta.extra_info = {}
+            return kv_batch_meta2batch_meta(kv_meta)
+
+        batch_meta = type(_concat_safe_batch_meta(data[0]._kv_meta)).concat(
+            [_concat_safe_batch_meta(item._kv_meta) for item in data]
         )
         merged_kv_meta = batch_meta2kv_batch_meta(batch_meta)
 
@@ -1175,12 +1330,14 @@ class LazyDataProto(DataProto):
         merged_meta = DataProto.concat([DataProto(batch=None, non_tensor_batch={}, meta_info=item.meta_info) for item in data], global_keys=global_keys).meta_info
         tensor_field_names = list(getattr(merged_kv_meta, "fields", None) or getattr(data[0], "_tensor_field_names", []))
 
-        return LazyDataProto.from_kv_batch_meta(
+        result = LazyDataProto.from_kv_batch_meta(
             merged_kv_meta,
             tensor_field_names=tensor_field_names,
             non_tensor_batch=merged_non_tensor,
             meta_info=merged_meta,
         )
+        log_dataflow("protocol.lazy.concat.exit", result)
+        return result
 
 
 class BatchData:
@@ -1246,31 +1403,44 @@ class BatchData:
         data = self._data
         if not data:
             raise ValueError("Cannot concatenate an empty list of data items.")
+        log_dataflow("protocol.batchdata.concat.enter", data)
 
         sample = data[0]
         BatchMeta, KVBatchMeta = self._maybe_import_tq_types()
 
         if isinstance(sample, (DataProto, LazyDataProto)):
-            return DataProto.concat(data)
+            result = DataProto.concat(data)
+            log_dataflow("protocol.batchdata.concat.exit", result)
+            return result
 
         if isinstance(sample, (ray.ObjectRef, ObjectRefWrap)):
-            return DataProto.materialize_concat(data)
+            result = DataProto.materialize_concat(data)
+            log_dataflow("protocol.batchdata.concat.exit", result)
+            return result
 
         if isinstance(sample, TensorDict):
-            return torch.cat(data, dim=0)
+            result = torch.cat(data, dim=0)
+            log_dataflow("protocol.batchdata.concat.exit", result)
+            return result
 
         if BatchMeta is not None and isinstance(sample, BatchMeta):
             batch_meta = BatchMeta.concat(data)
             from roll.utils.transferqueue_utils import batch_meta2kv_batch_meta
 
-            return batch_meta2kv_batch_meta(batch_meta)
+            result = batch_meta2kv_batch_meta(batch_meta)
+            log_dataflow("protocol.batchdata.concat.exit", result)
+            return result
 
         raise TypeError(f"Unsupported concat sample type: {type(sample)}")
 
     def prepare_for_remote(self, required_fields: Optional[List[str]] = None):
         data = self._data
+        log_dataflow("protocol.batchdata.prepare_for_remote.enter", data, required_fields=required_fields)
         if isinstance(data, LazyDataProto):
-            return data.prepare_for_remote(required_fields=required_fields)
+            result = data.prepare_for_remote(required_fields=required_fields)
+            log_dataflow("protocol.batchdata.prepare_for_remote.exit", result, required_fields=required_fields)
+            return result
+        log_dataflow("protocol.batchdata.prepare_for_remote.exit", data, required_fields=required_fields)
         return data
 
 
