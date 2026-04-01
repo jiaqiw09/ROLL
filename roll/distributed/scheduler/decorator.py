@@ -4,6 +4,7 @@ ref: https://github.com/volcengine/verl/blob/main/single_controller/base/decorat
 
 import gc
 import os
+import time
 import traceback
 from enum import Enum, auto
 from functools import wraps, partial
@@ -12,7 +13,13 @@ import ray
 import torch
 import asyncio
 
-from roll.distributed.scheduler.protocol import DataProto, ObjectRefWrap, BatchData, log_dataflow
+from roll.distributed.scheduler.protocol import (
+    DataProto,
+    ObjectRefWrap,
+    BatchData,
+    log_dataflow,
+    merge_metrics_into_result,
+)
 from roll.utils.logging import get_logger
 from roll.platforms import current_platform
 
@@ -237,14 +244,43 @@ def func_generator(cls, method_name, dispatch_fn, collect_fn, execute_fn):
         if method_name == "initialize":
             setattr(cls, "initialized", True)
 
+        total_start = time.perf_counter()
+        dispatch_start = time.perf_counter()
         args, kwargs = dispatch_fn(cls, *args, **kwargs)
+        dispatch_elapsed = time.perf_counter() - dispatch_start
         output = execute_fn(method_name, *args, **kwargs)
         if blocking:
             timeout = None
             if "roll_RPC_TIMEOUT" in os.environ:
                 timeout = int(os.environ.get("roll_RPC_TIMEOUT"))
+            ray_get_start = time.perf_counter()
             output = ray.get(output, timeout=timeout)
+            ray_get_elapsed = time.perf_counter() - ray_get_start
+        else:
+            ray_get_elapsed = 0.0
+        collect_start = time.perf_counter()
         output = collect_fn(cls, output)
+        collect_elapsed = time.perf_counter() - collect_start
+        if blocking:
+            cluster_name = getattr(cls, "cluster_name", type(cls).__name__)
+            total_elapsed = time.perf_counter() - total_start
+            output = merge_metrics_into_result(
+                output,
+                {
+                    f"time/controller/{cluster_name}/{method_name}/dispatch": dispatch_elapsed,
+                    f"time/controller/{cluster_name}/{method_name}/ray_get": ray_get_elapsed,
+                    f"time/controller/{cluster_name}/{method_name}/collect": collect_elapsed,
+                    f"time/controller/{cluster_name}/{method_name}/total": total_elapsed,
+                },
+            )
+            logger.info(
+                "[perf][decorator.func_generator] "
+                f"cluster={cluster_name} method={method_name} "
+                f"dispatch={dispatch_elapsed:.6f}s "
+                f"ray_get={ray_get_elapsed:.6f}s "
+                f"collect={collect_elapsed:.6f}s "
+                f"total={total_elapsed:.6f}s"
+            )
         return output
 
     return func

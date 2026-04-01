@@ -577,7 +577,12 @@ class RLVRPipeline(BasePipeline):
                         batch.meta_info["disable_adapter"] = False
                     batch.meta_info["is_offload_states"] = False
                     if self.pipeline_config.adv_estimator == "gae":
+                        values_submit_start = time.perf_counter()
                         values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
+                        metrics_mgr.add_metric(
+                            "time/controller/critic/compute_values/submit",
+                            time.perf_counter() - values_submit_start,
+                        )
 
                     if self.pipeline_config.enable_old_logprobs_recompute:
                         batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
@@ -592,8 +597,15 @@ class RLVRPipeline(BasePipeline):
                                 "actor_train/compute_log_probs",
                             )
                             metrics_mgr.add_metrics(dynamic_batching_metrics)
+                        old_log_probs_submit_start = time.perf_counter()
                         old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
-                        old_log_probs = BatchData(old_log_probs_refs).concat()
+                        metrics_mgr.add_metric(
+                            "time/controller/actor_train/compute_log_probs/submit",
+                            time.perf_counter() - old_log_probs_submit_start,
+                        )
+                        old_log_probs = BatchData(old_log_probs_refs).concat(
+                            metric_prefix="actor_train/compute_log_probs"
+                        )
                         log_dataflow("rlvr.after_actor_compute_log_probs_concat", old_log_probs, global_step=global_step)
 
                         # Customize_logging metrics, Double check call twice
@@ -601,7 +613,9 @@ class RLVRPipeline(BasePipeline):
                             old_log_probs_refs2: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
                                 batch, blocking=False
                             )
-                            old_log_probs2 = BatchData(old_log_probs_refs2).concat()
+                            old_log_probs2 = BatchData(old_log_probs_refs2).concat(
+                                metric_prefix="actor_train/compute_log_probs_logging_board"
+                            )
                             batch.batch["old_log_probs2"] = old_log_probs2.batch["log_probs"]
                             batch.batch["old_log_probs2_entropy"] = old_log_probs2.batch["entropy"]
 
@@ -619,7 +633,7 @@ class RLVRPipeline(BasePipeline):
                         batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
 
                     if self.pipeline_config.adv_estimator == "gae":
-                        values = BatchData(values_refs).concat()
+                        values = BatchData(values_refs).concat(metric_prefix="critic/compute_values")
                         log_dataflow("rlvr.after_critic_compute_values_concat", values, global_step=global_step)
                         batch = batch.union(values)
                         metrics_mgr.add_reduced_metrics(values.meta_info.pop("metrics", {}))
@@ -718,7 +732,12 @@ class RLVRPipeline(BasePipeline):
 
                 with Timer(name="step_train", logger=None) as step_train_timer:
                     if self.pipeline_config.adv_estimator == "gae":
+                        critic_train_submit_start = time.perf_counter()
                         critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
+                        metrics_mgr.add_metric(
+                            "time/controller/critic/train_step/submit",
+                            time.perf_counter() - critic_train_submit_start,
+                        )
 
                     with actor_train_timer:
                         # implement critic warmup
@@ -741,13 +760,22 @@ class RLVRPipeline(BasePipeline):
                                     "actor_train/train_step",
                                 )
                                 metrics_mgr.add_metrics(dynamic_batching_metrics)
+                            actor_train_submit_start = time.perf_counter()
                             actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
-                            actor_train_metrics: DataProto = BatchData(actor_train_metrics_refs).concat()
+                            metrics_mgr.add_metric(
+                                "time/controller/actor_train/train_step/submit",
+                                time.perf_counter() - actor_train_submit_start,
+                            )
+                            actor_train_metrics: DataProto = BatchData(actor_train_metrics_refs).concat(
+                                metric_prefix="actor_train/train_step"
+                            )
                             log_dataflow("rlvr.after_actor_train_step_concat", actor_train_metrics, global_step=global_step)
                             metrics_mgr.add_reduced_metrics(actor_train_metrics.meta_info.pop("metrics", {}))
 
                     if self.pipeline_config.adv_estimator == "gae":
-                        critic_train_metrics = BatchData(critic_train_metrics_refs).concat()
+                        critic_train_metrics = BatchData(critic_train_metrics_refs).concat(
+                            metric_prefix="critic/train_step"
+                        )
                         log_dataflow("rlvr.after_critic_train_step_concat", critic_train_metrics, global_step=global_step)
                         metrics_mgr.add_reduced_metrics(critic_train_metrics.meta_info.pop("metrics", {}))
 

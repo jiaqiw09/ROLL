@@ -7,6 +7,7 @@ We can subclass Protocol to define more detailed batch info with specific keys
 import copy
 import os
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, Set
@@ -135,6 +136,18 @@ def log_dataflow(event: str, data=None, **context):
     if ctx:
         prefix = f"{prefix} {ctx}"
     logger.info(f"{prefix} {describe_dataflow(data)}")
+
+
+def merge_metrics_into_result(result, metrics: Optional[Dict[str, Any]] = None):
+    if not metrics:
+        return result
+    if isinstance(result, DataProto):
+        if result.meta_info is None:
+            result.meta_info = {}
+        current_metrics = result.meta_info.get("metrics", {}) or {}
+        current_metrics.update(metrics)
+        result.meta_info["metrics"] = current_metrics
+    return result
 
 
 def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
@@ -1153,8 +1166,9 @@ class LazyDataProto(DataProto):
                 ), f"key {key} length {len(val)} is not equal to batch size {batch_size}"
 
     def __len__(self):
-        if self.batch is not None:
-            return self.batch.batch_size[0]
+        raw_batch = self._raw_batch()
+        if raw_batch is not None:
+            return raw_batch.batch_size[0]
         if self.non_tensor_batch is not None and len(self.non_tensor_batch) > 0:
             return len(next(iter(self.non_tensor_batch.values())))
         if self._kv_meta is not None:
@@ -1168,11 +1182,14 @@ class LazyDataProto(DataProto):
                 materialized = object.__getattribute__(self, "_materialized")
                 raw_dict = object.__getattribute__(self, "__dict__")
                 batch = raw_dict.get("batch", None)
-                if kv_meta is not None and not materialized and batch is None:
-                    self.materialize()
-                    batch = raw_dict.get("batch", None)
                 if batch is not None:
                     return _TrackedTensorDictProxy(self, batch)
+                if kv_meta is not None and not materialized:
+                    if self.non_tensor_batch is not None and len(self.non_tensor_batch) > 0:
+                        batch_size = len(next(iter(self.non_tensor_batch.values())))
+                    else:
+                        batch_size = len(kv_meta.keys)
+                    return _TrackedTensorDictProxy(self, TensorDict({}, batch_size=(batch_size,)))
             except AttributeError:
                 pass
         return object.__getattribute__(self, name)
@@ -1318,6 +1335,89 @@ class LazyDataProto(DataProto):
     def _can_use_lazy_meta_ops(self) -> bool:
         return self._kv_meta is not None and len(self._local_authoritative_fields) == 0
 
+    def _flush_authoritative_to_tq(self) -> None:
+        """Flush local-authoritative tensor fields to TQ so that kv_meta is
+        up-to-date and _local_authoritative_fields can be cleared.
+
+        This is called automatically before any operation that needs all items
+        to be TQ-backed (e.g. concat), so that pipelines never have to call
+        prepare_for_remote() manually just to keep lazy identity.
+
+        After the call:
+        - Fields successfully written to TQ are removed from _local_authoritative_fields.
+        - Fields that TQ rejected (e.g. dtype mismatch) remain in _local_authoritative_fields
+          so they can be carried as overlay through concat/select.
+        - The local batch cache is kept intact (no extra fetch needed on read).
+        """
+        if self._kv_meta is None or not self._local_authoritative_fields:
+            return
+        start_time = time.perf_counter()
+        from roll.utils.transferqueue_utils import kv_batch_meta_put_tensordict
+        import transfer_queue as tq
+
+        local = self._raw_batch()
+        if local is None:
+            self._local_authoritative_fields.clear()
+            return
+        dirty = list(self._local_authoritative_fields)
+        present = [f for f in dirty if f in local.keys()]
+        if present:
+            fields_before = set(getattr(self._kv_meta, "fields", None) or [])
+            td = local.select(*present)
+            overlap_fields = [field for field in present if field in fields_before]
+            if overlap_fields:
+                try:
+                    existing_td = tq.kv_batch_get(
+                        keys=self._kv_meta.keys,
+                        partition_id=self._kv_meta.partition_id,
+                        fields=overlap_fields,
+                    )
+                    for field in overlap_fields:
+                        if field not in existing_td.keys():
+                            continue
+                        existing_value = existing_td[field]
+                        incoming_value = td[field]
+                        existing_dtype = getattr(existing_value, "dtype", None)
+                        incoming_dtype = getattr(incoming_value, "dtype", None)
+                        if existing_dtype is None or incoming_dtype is None or existing_dtype == incoming_dtype:
+                            continue
+                        casted_value = incoming_value.to(dtype=existing_dtype)
+                        td[field] = casted_value
+                        local[field] = casted_value
+                except Exception as exc:
+                    logger.warning(f"Failed to align dirty field dtype before TQ flush: {exc}")
+            self._kv_meta = kv_batch_meta_put_tensordict(
+                self._kv_meta, td, "LazyDataProto._flush_authoritative_to_tq"
+            )
+            # NOTE: do NOT overwrite kv_meta.fields here.
+            # kv_batch_meta_put_tensordict already updates meta.fields to reflect
+            # what TQ actually accepted. Overwriting would incorrectly add fields
+            # that TQ rejected (e.g. dtype mismatch), causing KeyErrors on fetch.
+            fields_after = set(getattr(self._kv_meta, "fields", None) or [])
+            confirmed = set(present) & fields_after
+            failed = set(present) - confirmed
+            # Clear authoritative only for fields confirmed in TQ.
+            self._local_authoritative_fields -= confirmed
+            # Fields that TQ rejected remain in _local_authoritative_fields;
+            # they will be carried as overlay through concat.
+            for field in confirmed:
+                if field not in self._tensor_field_names:
+                    self._tensor_field_names.append(field)
+            log_dataflow("protocol.lazy.flush_authoritative", self,
+                         flushed_fields=list(confirmed), failed_fields=list(failed))
+            logger.info(
+                "[perf][protocol.lazy.flush_authoritative] "
+                f"elapsed={time.perf_counter() - start_time:.6f}s "
+                f"dirty={len(dirty)} flushed={len(confirmed)} failed={len(failed)}"
+            )
+        else:
+            self._local_authoritative_fields.clear()
+            logger.info(
+                "[perf][protocol.lazy.flush_authoritative] "
+                f"elapsed={time.perf_counter() - start_time:.6f}s dirty=0 flushed=0 failed=0"
+            )
+
+
     def set_tensor_field(self, key: str, value: torch.Tensor) -> "LazyDataProto":
         raw_batch = self._raw_batch()
         if raw_batch is None:
@@ -1397,6 +1497,92 @@ class LazyDataProto(DataProto):
         log_dataflow("protocol.lazy.pop.exit", self, remaining_tensor_fields=list(self._tensor_field_names))
         return result
 
+    def select(
+        self,
+        batch_keys=None,
+        non_tensor_batch_keys=None,
+        meta_info_keys=None,
+        deepcopy=False,
+    ) -> "LazyDataProto":
+        """Lazy-aware select: returns a LazyDataProto narrowed to the requested
+        fields instead of triggering a full materialize.
+
+        When kv_meta is present, we only update ``_tensor_field_names`` so that
+        a later materialize() fetches only the requested subset from TQ.  Local
+        cache entries that are already present are inherited directly.
+
+        Falls back to the parent DataProto.select when there is no kv_meta
+        (i.e. the object is already fully eager).
+        """
+        if self._kv_meta is None:
+            return DataProto.select(
+                self,
+                batch_keys=batch_keys,
+                non_tensor_batch_keys=non_tensor_batch_keys,
+                meta_info_keys=meta_info_keys,
+                deepcopy=deepcopy,
+            )
+
+        # --- tensor fields ---
+        all_known = list(dict.fromkeys(self._tensor_field_names))
+        if batch_keys is not None:
+            batch_keys = list(batch_keys)
+            new_tensor_fields = [f for f in batch_keys if f in all_known]
+        else:
+            new_tensor_fields = all_known
+
+        # --- non-tensor fields ---
+        if non_tensor_batch_keys is not None:
+            new_non_tensor = {
+                k: (copy.deepcopy(v) if deepcopy else v)
+                for k, v in self.non_tensor_batch.items()
+                if k in non_tensor_batch_keys
+            }
+        else:
+            new_non_tensor = (
+                copy.deepcopy(self.non_tensor_batch) if deepcopy else dict(self.non_tensor_batch)
+            )
+
+        # --- meta info ---
+        if meta_info_keys is not None:
+            new_meta = {k: v for k, v in self.meta_info.items() if k in meta_info_keys}
+        else:
+            new_meta = self.meta_info
+        if deepcopy:
+            new_meta = copy.deepcopy(new_meta)
+
+        # Build new LazyDataProto with narrowed field list
+        new_kv_meta = copy.deepcopy(self._kv_meta)
+        if hasattr(new_kv_meta, "fields"):
+            new_kv_meta.fields = list(new_tensor_fields)
+
+        result = type(self).from_kv_batch_meta(
+            new_kv_meta,
+            tensor_field_names=new_tensor_fields,
+            non_tensor_batch=new_non_tensor,
+            meta_info=new_meta,
+        )
+
+        # Inherit local cache / authoritative entries that are still relevant
+        local = self._raw_batch()
+        if local is not None:
+            present = {f: local[f] for f in new_tensor_fields if f in local.keys()}
+            if present:
+                object.__setattr__(
+                    result,
+                    "batch",
+                    TensorDict(source=present, batch_size=local.batch_size),
+                )
+                result._local_cached_fields.update(
+                    set(present.keys()) & self._local_cached_fields
+                )
+                result._local_authoritative_fields.update(
+                    set(present.keys()) & self._local_authoritative_fields
+                )
+        result._refresh_materialized_status()
+        log_dataflow("protocol.lazy.select.exit", result, batch_keys=new_tensor_fields)
+        return result
+
     def union(self, other: "DataProto") -> "DataProto":
         if not isinstance(other, (DataProto, LazyDataProto)):
             raise TypeError(f"union expects DataProto/LazyDataProto, got {type(other)}")
@@ -1464,6 +1650,7 @@ class LazyDataProto(DataProto):
             return self
 
         required_fields = list(required_fields or self._tensor_field_names)
+        start_time = time.perf_counter()
         log_dataflow("protocol.lazy.prepare_for_remote.enter", self, required_fields=required_fields)
         local_batch = self._raw_batch()
         if local_batch is not None:
@@ -1493,6 +1680,11 @@ class LazyDataProto(DataProto):
                 "non_tensor_batch": copy.deepcopy(self.non_tensor_batch),
             }
         log_dataflow("protocol.lazy.prepare_for_remote.exit", self._kv_meta, required_fields=required_fields)
+        logger.info(
+            "[perf][protocol.lazy.prepare_for_remote] "
+            f"elapsed={time.perf_counter() - start_time:.6f}s "
+            f"required_fields={len(required_fields)} local_required_fields={len(local_required_fields)}"
+        )
         return self._kv_meta
 
     def chunk(self, chunks: int) -> List["DataProto"]:
@@ -1668,6 +1860,14 @@ class LazyDataProto(DataProto):
             raise ValueError("Cannot concatenate an empty list.")
         log_dataflow("protocol.lazy.concat.enter", data, global_keys=sorted(global_keys or {"metrics"}))
 
+        # Auto-flush: push any locally-authoritative fields to TQ before we
+        # test whether a pure-lazy concat is possible.  This lets pipelines
+        # write fields (batch["k"] = v) and call concat without ever touching
+        # prepare_for_remote() manually.
+        for item in data:
+            if isinstance(item, LazyDataProto) and item._kv_meta is not None:
+                item._flush_authoritative_to_tq()
+
         all_lazy = all(
             isinstance(item, LazyDataProto) and item._can_use_lazy_meta_ops()
             for item in data
@@ -1712,6 +1912,56 @@ class LazyDataProto(DataProto):
             non_tensor_batch=merged_non_tensor,
             meta_info=merged_meta,
         )
+        overlay_field_sets = []
+        for item in data:
+            if isinstance(item, LazyDataProto):
+                overlay_fields = item._local_overlay_field_names()
+                if overlay_fields:
+                    overlay_field_sets.append(set(overlay_fields))
+        if overlay_field_sets:
+            common_overlay_fields = set.intersection(*overlay_field_sets)
+        else:
+            common_overlay_fields = set()
+
+        if common_overlay_fields:
+            overlay_tensors = {}
+            authoritative_fields = set()
+            cached_fields = set()
+            for field_name in sorted(common_overlay_fields):
+                parts = []
+                field_authoritative = False
+                field_cached = True
+                for item in data:
+                    local_batch = item._raw_batch() if isinstance(item, LazyDataProto) else None
+                    if local_batch is None or field_name not in local_batch.keys():
+                        field_cached = False
+                        parts = []
+                        break
+                    parts.append(local_batch[field_name])
+                    if isinstance(item, LazyDataProto) and field_name in item._local_authoritative_fields:
+                        field_authoritative = True
+                    if not (isinstance(item, LazyDataProto) and field_name in item._local_cached_fields):
+                        field_cached = False
+                if not parts:
+                    continue
+                overlay_tensors[field_name] = torch.cat(parts, dim=0)
+                if field_authoritative:
+                    authoritative_fields.add(field_name)
+                if field_cached:
+                    cached_fields.add(field_name)
+
+            if overlay_tensors:
+                object.__setattr__(
+                    result,
+                    "batch",
+                    TensorDict(source=overlay_tensors, batch_size=(len(result),)),
+                )
+                result._local_cached_fields.update(cached_fields)
+                result._local_authoritative_fields.update(authoritative_fields)
+                for field_name in overlay_tensors.keys():
+                    if field_name not in result._tensor_field_names:
+                        result._tensor_field_names.append(field_name)
+                result._refresh_materialized_status()
         log_dataflow("protocol.lazy.concat.exit", result)
         return result
 
@@ -1775,7 +2025,7 @@ class BatchData:
 
         return data.chunk(chunks=chunks)
 
-    def concat(self):
+    def concat(self, metric_prefix: Optional[str] = None):
         data = self._data
         if not data:
             raise ValueError("Cannot concatenate an empty list of data items.")
@@ -1790,7 +2040,56 @@ class BatchData:
             return result
 
         if isinstance(sample, (ray.ObjectRef, ObjectRefWrap)):
-            result = DataProto.materialize_concat(data)
+            timeout = None
+            if "roll_RPC_TIMEOUT" in os.environ:
+                timeout = int(os.environ["roll_RPC_TIMEOUT"])
+            total_start = time.perf_counter()
+
+            ray_get_start = time.perf_counter()
+            if isinstance(sample, ObjectRefWrap):
+                obj_refs = [ref.obj_ref for ref in data]
+                fetched = ray.get(obj_refs, timeout=timeout)
+                realized = [fetched[i] for i, ref in enumerate(data) if ref.collected]
+            else:
+                realized = ray.get(data, timeout=timeout)
+            ray_get_elapsed = time.perf_counter() - ray_get_start
+
+            if not realized:
+                result = DataProto()
+                if metric_prefix:
+                    result = merge_metrics_into_result(
+                        result,
+                        {
+                            f"time/controller/{metric_prefix}/collect/ray_get": ray_get_elapsed,
+                            f"time/controller/{metric_prefix}/collect/concat": 0.0,
+                            f"time/controller/{metric_prefix}/collect/total": time.perf_counter() - total_start,
+                        },
+                    )
+                log_dataflow("protocol.batchdata.concat.exit", result)
+                return result
+
+            # Re-dispatch based on what workers actually returned.
+            concat_start = time.perf_counter()
+            result = BatchData(realized).concat()
+            concat_elapsed = time.perf_counter() - concat_start
+            total_elapsed = time.perf_counter() - total_start
+            if metric_prefix:
+                result = merge_metrics_into_result(
+                    result,
+                    {
+                        f"time/controller/{metric_prefix}/collect/ray_get": ray_get_elapsed,
+                        f"time/controller/{metric_prefix}/collect/concat": concat_elapsed,
+                        f"time/controller/{metric_prefix}/collect/total": total_elapsed,
+                    },
+                )
+            logger.info(
+                "[perf][protocol.batchdata.concat.objectref] "
+                f"prefix={metric_prefix or 'none'} "
+                f"ray_get={ray_get_elapsed:.6f}s "
+                f"concat={concat_elapsed:.6f}s "
+                f"total={total_elapsed:.6f}s "
+                f"realized={len(realized)}"
+            )
             log_dataflow("protocol.batchdata.concat.exit", result)
             return result
 

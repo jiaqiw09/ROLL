@@ -234,21 +234,29 @@ def apply_train_infer_correction_to_batch(
         apply_filters=True,
     )
 
-    # Set train_infer_is_weight
-    batch.batch["train_infer_is_weight"] = is_w
+    # Set train_infer_is_weight.
+    # Keep the original floating dtype if the field already exists in TQ/local cache,
+    # otherwise use the freshly computed dtype.
+    if "train_infer_is_weight" in batch.batch:
+        batch.batch["train_infer_is_weight"] = is_w.to(batch.batch["train_infer_is_weight"].dtype)
+    else:
+        batch.batch["train_infer_is_weight"] = is_w
 
     # Apply filter mask to all specified masks
     for key in update_mask_keys:
         if key in batch.batch:
             mask_tensor = batch.batch[key]
+            filter_mask_cast = filter_mask.to(mask_tensor.dtype)
             # Check if mask is already sliced (shape [B, T-1]) or full (shape [B, T])
             # final_response_mask is already [:, 1:] sliced in get_sample_level_mask
             if mask_tensor.shape[-1] == filter_mask.shape[-1]:
                 # Mask is already sliced (e.g., final_response_mask)
-                batch.batch[key] = mask_tensor.long() * filter_mask.long()
+                batch.batch[key] = (mask_tensor.to(filter_mask_cast.dtype) * filter_mask_cast).to(mask_tensor.dtype)
             else:
                 # Mask is full shape (e.g., response_mask), apply to [:, 1:] part
-                batch.batch[key][:, 1:] = mask_tensor[:, 1:].long() * filter_mask.long()
+                batch.batch[key][:, 1:] = (
+                    mask_tensor[:, 1:].to(filter_mask_cast.dtype) * filter_mask_cast
+                ).to(mask_tensor.dtype)
         else:
             logger.warning(f"Mask key '{key}' not found in batch, skipping update.")
 

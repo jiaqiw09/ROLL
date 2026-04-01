@@ -608,8 +608,32 @@ def difficulty_mask(data: "DataProto", n_sample=-1, low_threshold=0.1, high_thre
     return data
 
 
+def _field_writeback_dtype(
+    data: "DataProto", primary_key: Optional[str] = None, fallback_keys: Optional[List[str]] = None
+) -> Optional[torch.dtype]:
+    candidate_keys = []
+    if primary_key is not None:
+        candidate_keys.append(primary_key)
+    candidate_keys.extend(fallback_keys or [])
+    for key in candidate_keys:
+        if key in data.batch.keys():
+            return data.batch[key].dtype
+    return None
+
+
+def _cast_reward_writeback(tensor: torch.Tensor, dtype: Optional[torch.dtype]) -> torch.Tensor:
+    if dtype is None or not torch.is_floating_point(tensor):
+        return tensor
+    return tensor.to(dtype=dtype)
+
+
 @torch.no_grad()
 def compute_token_reward(data: "DataProto", pipeline_config: PPOConfig, kl_ctrl: AdaptiveKLController):
+    writeback_dtype = _field_writeback_dtype(
+        data,
+        primary_key="token_level_rewards",
+        fallback_keys=["response_level_rewards"],
+    )
     token_level_rewards = expand_to_token_level(data)
     beta = 0
     kld = compute_approx_kl(
@@ -640,12 +664,13 @@ def compute_token_reward(data: "DataProto", pipeline_config: PPOConfig, kl_ctrl:
             token_level_rewards, min=-pipeline_config.reward_clip, max=pipeline_config.reward_clip
         )
 
-    data.batch["token_level_rewards"] = token_level_rewards
+    data.batch["token_level_rewards"] = _cast_reward_writeback(token_level_rewards, writeback_dtype)
     return data, metrics
 
 
 @torch.no_grad()
 def reward_postprocess(data: "DataProto", pipeline_config: RLVRConfig, running_ctrl):
+    writeback_dtype = _field_writeback_dtype(data, primary_key="response_level_rewards")
     response_level_rewards = data.batch["response_level_rewards"].clone().detach()
     response_level_metrics = {"critic/reward_clip_frac": 0.0}
     # 对reward进行处理: 可以灵活定义不同的normalization方法
@@ -671,7 +696,7 @@ def reward_postprocess(data: "DataProto", pipeline_config: RLVRConfig, running_c
 
         response_level_metrics = {"critic/reward_clip_frac": reward_clip_frac}
 
-    data.batch["response_level_rewards"] = response_level_rewards
+    data.batch["response_level_rewards"] = _cast_reward_writeback(response_level_rewards, writeback_dtype)
     return data, response_level_metrics
 
 
@@ -727,6 +752,9 @@ def get_sample_level_mask(data: "DataProto", pipeline_config: RLVRConfig):
 
     expanded_sample_mask = final_sample_mask.unsqueeze(-1).expand_as(response_mask)
     final_response_mask = response_mask * expanded_sample_mask
+     # ensure it inherits the original dtype to avoid TQ dtype mismatch 
+    # (final_sample_mask is float32 which upcasts the result)
+    final_response_mask = final_response_mask.to(response_mask.dtype)
     mask_metrics["actor/final_mask_ratio"] = final_sample_mask.mean().item()
     mask_metrics["actor/samples_used"] = final_sample_mask.sum().item()
     mask_metrics["actor/samples_total"] = float(batch_size)
@@ -782,6 +810,11 @@ def compute_advantage(
     response_mask=None,
     pipeline_config=None,
 ):
+    writeback_dtype = _field_writeback_dtype(
+        data,
+        primary_key="token_level_rewards",
+        fallback_keys=["response_level_rewards"],
+    )
     if response_mask is None:
         response_mask = data.batch["response_mask"][:, 1:]
     if response_mask.sum() == 0:
@@ -808,13 +841,13 @@ def compute_advantage(
     if is_pure_opd:
         advantages = -kld
         returns = advantages
-        data.batch["raw_advantages"] = advantages
+        raw_advantages = advantages
     else:
         token_level_rewards = data.batch["token_level_rewards"].float()
         if whiten_rewards:
             token_level_rewards = masked_whiten(values=token_level_rewards, mask=response_mask)
         token_level_rewards = token_level_rewards * response_mask
-        data.batch["token_level_rewards"] = token_level_rewards
+        data.batch["token_level_rewards"] = _cast_reward_writeback(token_level_rewards, writeback_dtype)
         if adv_estimator == "gae":
             values = data.batch["values"].float()
             data.batch["values"] = values * response_mask
@@ -828,7 +861,7 @@ def compute_advantage(
         else:
             raise NotImplementedError
 
-        data.batch["raw_advantages"] = advantages
+        raw_advantages = advantages
 
         # Apply mixed OPD mode
         if use_opd:
@@ -844,8 +877,9 @@ def compute_advantage(
         data.meta_info["metrics"] = {"critic/advantage_clip_frac": adv_clip_frac}
         advantages = torch.clamp(advantages, min=-advantage_clip, max=advantage_clip)
 
-    data.batch["advantages"] = advantages
-    data.batch["returns"] = returns
+    data.batch["raw_advantages"] = _cast_reward_writeback(raw_advantages, writeback_dtype)
+    data.batch["advantages"] = _cast_reward_writeback(advantages, writeback_dtype)
+    data.batch["returns"] = _cast_reward_writeback(returns, writeback_dtype)
     return data
 
 def postprocess_generate(
@@ -1329,4 +1363,3 @@ def batch_balance(batch: DataProto, dp_size, minibatch_size, logging_prefix="glo
     metrics = {}
     metrics.update(global_balance_stats)
     return metrics
-
