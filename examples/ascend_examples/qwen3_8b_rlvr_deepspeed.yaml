@@ -21,7 +21,10 @@ checkpoint_config:
   type: file_system
   output_dir: ./ckpt
 
-num_gpus_per_node: 8
+num_gpus_per_node: 16
+
+generate_opt_level: 0
+enable_old_logprobs_recompute: true
 
 max_steps: 200
 save_steps: 100
@@ -30,9 +33,9 @@ eval_steps: 10
 resume_from_checkpoint: false
 
 
-rollout_batch_size: 64  # prompt
-prompt_length: 1024
-response_length: 2048
+rollout_batch_size: 32  # prompt
+prompt_length: 2048
+response_length: 8192
 
 num_return_sequences_in_group: 8
 ppo_epochs: 1
@@ -98,7 +101,7 @@ actor_train:
     learning_rate: 1.0e-6
     weight_decay: 0
     per_device_train_batch_size: 1
-    gradient_accumulation_steps: 16
+    gradient_accumulation_steps: 8
     warmup_steps: 20
     num_train_epochs: 50
   data_args:
@@ -114,8 +117,8 @@ actor_train:
   strategy_args:
     strategy_name: deepspeed_train
     strategy_config: ${deepspeed_zero3}
-  device_mapping: list(range(0,4))
-  infer_batch_size: 4
+  device_mapping: list(range(0,8))
+  infer_batch_size: 2
 
 actor_infer:
   model_args:
@@ -137,7 +140,7 @@ actor_infer:
       gpu_memory_utilization: 0.6
       block_size: 16
       max_model_len: 8000
-  device_mapping: list(range(4,6))
+  device_mapping: list(range(8,12))
   infer_batch_size: 4
 
 reference:
@@ -151,8 +154,8 @@ reference:
   strategy_args:
     strategy_name: hf_infer
     strategy_config: ~
-  device_mapping: list(range(6,8))
-  infer_batch_size: 4
+  device_mapping: list(range(12,16))
+  infer_batch_size: 1
 
 rewards:
   math_rule:
