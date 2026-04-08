@@ -38,6 +38,8 @@ _BatchMeta_cls = None
 
 TQ_DISPATCH_TRACE_KEY = "_tq_dispatch_trace"
 TQ_COLLECT_TRACE_KEY = "_tq_collect_trace"
+NO_TQ_DISPATCH_TRACE_KEY = "_no_tq_dispatch_trace"
+NO_TQ_COLLECT_TRACE_KEY = "_no_tq_collect_trace"
 
 
 def _calc_tensordict_size_mb(td) -> float:
@@ -336,25 +338,46 @@ def tqbridge(dispatch_mode=None):
         @wraps(func)
         def inner(*args, **kwargs):
             import time
-            tq, BatchMeta, _ = _ensure_tq_imports()
+            tq, BatchMeta = _ensure_tq_imports()
             batch_meta = _find_batch_meta(*args, **kwargs)
             if batch_meta is None:
+                no_tq_dispatch_trace = _extract_first_trace_from_dataprotos(
+                    NO_TQ_DISPATCH_TRACE_KEY, args, kwargs
+                )
                 for arg in args:
                     if isinstance(arg, DataProto) and arg.batch is not None:
                         rows = arg.batch.batch_size[0]
                         data_mb = _calc_dataproto_size_mb(arg)
-                        logger.info(
+                        logger.debug(
                             f"[NO TQ worker] {func.__name__} | INPUT VIA RAY | rows={rows} "
                             f"| data={data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
                         )
+                        if no_tq_dispatch_trace is not None:
+                            e2e_total = max(0.0, time.time() - no_tq_dispatch_trace["dispatch_started_at"])
+                            logger.info(
+                                f"[NO TQ dispatch E2E] {func.__name__} | trace_id={no_tq_dispatch_trace['trace_id']} "
+                                f"| rows={rows} | data={data_mb:.2f}MB | total={e2e_total:.3f}s"
+                            )
                 output = func(*args, **kwargs)
                 writable_td = _extract_writable_tensordict(output)
                 if writable_td is not None:
                     write_data_mb = _calc_tensordict_size_mb(writable_td)
-                    logger.info(
+                    logger.debug(
                         f"[NO TQ worker] {func.__name__} | OUTPUT VIA RAY | rows={writable_td.batch_size[0]} "
                         f"| data={write_data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
                     )
+                    if isinstance(output, DataProto):
+                        output.meta_info = _attach_trace(
+                            output.meta_info,
+                            NO_TQ_COLLECT_TRACE_KEY,
+                            {
+                                "trace_id": uuid.uuid4().hex[:12],
+                                "worker_write_started_at": time.time(),
+                                "worker_name": func.__name__,
+                                "rows": writable_td.batch_size[0],
+                                "data_mb": write_data_mb,
+                            },
+                        )
                 return output
 
             global TQ_INITIALIZED
@@ -452,25 +475,46 @@ def tqbridge(dispatch_mode=None):
         @wraps(func)
         async def async_inner(*args, **kwargs):
             import time
-            tq, BatchMeta, _ = _ensure_tq_imports()
+            tq, BatchMeta = _ensure_tq_imports()
             batch_meta = _find_batch_meta(*args, **kwargs)
             if batch_meta is None:
+                no_tq_dispatch_trace = _extract_first_trace_from_dataprotos(
+                    NO_TQ_DISPATCH_TRACE_KEY, args, kwargs
+                )
                 for arg in args:
                     if isinstance(arg, DataProto) and arg.batch is not None:
                         rows = arg.batch.batch_size[0]
                         data_mb = _calc_dataproto_size_mb(arg)
-                        logger.info(
+                        logger.debug(
                             f"[NO TQ worker] {func.__name__} | INPUT VIA RAY | rows={rows} "
                             f"| data={data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
                         )
+                        if no_tq_dispatch_trace is not None:
+                            e2e_total = max(0.0, time.time() - no_tq_dispatch_trace["dispatch_started_at"])
+                            logger.info(
+                                f"[NO TQ dispatch E2E] {func.__name__} | trace_id={no_tq_dispatch_trace['trace_id']} "
+                                f"| rows={rows} | data={data_mb:.2f}MB | total={e2e_total:.3f}s"
+                            )
                 output = await func(*args, **kwargs)
                 writable_td = _extract_writable_tensordict(output)
                 if writable_td is not None:
                     write_data_mb = _calc_tensordict_size_mb(writable_td)
-                    logger.info(
+                    logger.debug(
                         f"[NO TQ worker] {func.__name__} | OUTPUT VIA RAY | rows={writable_td.batch_size[0]} "
                         f"| data={write_data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
                     )
+                    if isinstance(output, DataProto):
+                        output.meta_info = _attach_trace(
+                            output.meta_info,
+                            NO_TQ_COLLECT_TRACE_KEY,
+                            {
+                                "trace_id": uuid.uuid4().hex[:12],
+                                "worker_write_started_at": time.time(),
+                                "worker_name": func.__name__,
+                                "rows": writable_td.batch_size[0],
+                                "data_mb": write_data_mb,
+                            },
+                        )
                 return output
 
             global TQ_INITIALIZED

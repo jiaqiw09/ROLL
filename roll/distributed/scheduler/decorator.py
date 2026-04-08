@@ -325,15 +325,51 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
         return all_args, all_kwargs
 
     # ---- original path (no TQ) ----
+    from roll.utils.transferqueue_utils import NO_TQ_DISPATCH_TRACE_KEY, _attach_trace
+
     splitted_args, splitted_kwargs = _split_args_kwargs(cluster.dp_size, *args, **kwargs)
     for arg in args:
         if isinstance(arg, DataProto):
             rows = arg.batch.batch_size[0] if arg.batch is not None else 0
             data_mb = _calc_dataproto_size_mb(arg)
-            logger.info(
+            logger.debug(
                 f"[NO TQ dispatch] TRIGGERED | rows={rows} | tensor_data={data_mb:.2f}MB "
                 f"| dp_size={cluster.dp_size} | ray_payload={data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
             )
+
+    def _attach_no_tq_trace(shards):
+        if not isinstance(shards, (Tuple, List)):
+            return shards
+        trace_id = uuid.uuid4().hex[:12]
+        dispatch_started_at = time.time()
+        traced_shards = []
+        for shard in shards:
+            if isinstance(shard, DataProto):
+                shard_rows = shard.batch.batch_size[0] if shard.batch is not None else 0
+                shard_data_mb = _calc_dataproto_size_mb(shard)
+                shard.meta_info = _attach_trace(
+                    shard.meta_info,
+                    NO_TQ_DISPATCH_TRACE_KEY,
+                    {
+                        "trace_id": trace_id,
+                        "dispatch_started_at": dispatch_started_at,
+                        "rows": shard_rows,
+                        "data_mb": shard_data_mb,
+                        "dp_size": cluster.dp_size,
+                    },
+                )
+            traced_shards.append(shard)
+        return traced_shards
+
+    splitted_args = [
+        _attach_no_tq_trace(arg) if isinstance(arg, (Tuple, List)) and arg and isinstance(arg[0], DataProto) else arg
+        for arg in splitted_args
+    ]
+    splitted_kwargs = {
+        k: _attach_no_tq_trace(v) if isinstance(v, (Tuple, List)) and v and isinstance(v[0], DataProto) else v
+        for k, v in splitted_kwargs.items()
+    }
+
     all_args = []
 
     def get_arg_by_rank_info(arg, rank_info):
@@ -391,12 +427,11 @@ def collect_dp_mp_compute(cluster, output):
     is_refs = isinstance(output[0], ray.ObjectRef) if output else False
     if is_refs:
         import os, ray as _ray
-        import time
         timeout = int(os.environ.get("roll_RPC_TIMEOUT", 3600))
         t0 = time.time()
         raw_output = _ray.get(list(output), timeout=timeout)
         ray_get_cost = time.time() - t0
-        logger.info(
+        logger.debug(
             f"[NO TQ collect] ray.get DONE | world_size={cluster.world_size} "
             f"| cost={ray_get_cost:.3f}s | rss={_get_process_rss_gb():.3f}GB"
         )
@@ -497,12 +532,29 @@ def collect_dp_mp_compute(cluster, output):
     if isinstance(rep_results[0], list):
         return list(chain.from_iterable(rep_results))
     elif isinstance(rep_results[0], DataProto):
+        from roll.utils.transferqueue_utils import NO_TQ_COLLECT_TRACE_KEY, _pop_trace
+
         result_mb = sum(_calc_dataproto_size_mb(result) for result in rep_results)
         total_rows = sum(result.batch.batch_size[0] for result in rep_results if result.batch is not None)
-        logger.info(
-            f"[NO TQ collect] CONCAT TRIGGERED | dp_results={len(rep_results)} "
-            f"| total_rows={total_rows} | data={result_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
-        )
+        collect_traces = []
+        for result in rep_results:
+            trace = _pop_trace(result.meta_info, NO_TQ_COLLECT_TRACE_KEY)
+            if isinstance(trace, dict):
+                collect_traces.append(trace)
+        if collect_traces:
+            first_write_started_at = min(trace["worker_write_started_at"] for trace in collect_traces)
+            worker_name = collect_traces[0].get("worker_name", "unknown")
+            e2e_total = max(0.0, time.time() - first_write_started_at)
+            logger.info(
+                f"[NO TQ collect E2E] {worker_name} | traces={len(collect_traces)} "
+                f"| rows={total_rows} | data={result_mb:.2f}MB | total={e2e_total:.3f}s "
+                f"| ray_get={ray_get_cost if is_refs else 0.0:.3f}s"
+            )
+        else:
+            logger.info(
+                f"[NO TQ collect E2E] rows={total_rows} | data={result_mb:.2f}MB "
+                f"| ray_get={ray_get_cost if is_refs else 0.0:.3f}s | rss={_get_process_rss_gb():.3f}GB"
+            )
         return DataProto.concat(rep_results)
     else:
         raise NotImplementedError(f"output type {type(rep_results[0])}")
