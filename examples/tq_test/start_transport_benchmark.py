@@ -2,8 +2,6 @@ import argparse
 import os
 from types import SimpleNamespace
 
-import ray
-
 os.environ["TORCH_EXTENSIONS_DIR"] = "/tmp/torch_extensions"
 os.makedirs("/tmp/torch_extensions", exist_ok=True)
 
@@ -17,6 +15,7 @@ from roll.utils.transferqueue_utils import init_tq
 from examples.tq_test.transport_benchmark_example import (
     TransportBenchmarkWorker,
     build_transport_benchmark_batch,
+    payload_width_from_total_bytes,
 )
 
 
@@ -66,6 +65,12 @@ def main():
         default=4 * 1024 * 1024,
         help="Number of float16 elements per row in transport_payload",
     )
+    parser.add_argument(
+        "--payload-total-mb",
+        type=float,
+        default=None,
+        help="Target size in MB for the whole transport_payload tensor. Overrides --payload-width.",
+    )
     parser.add_argument("--use-tq", action="store_true", help="Enable TransferQueue on the driver side")
     parser.add_argument(
         "--tq-total-storage-size",
@@ -83,6 +88,7 @@ def main():
 
     gpu_ids = _parse_gpus(args.gpus)
     world_size = len(gpu_ids)
+    device_mapping_expr = str(gpu_ids)
 
     init()
 
@@ -104,7 +110,7 @@ def main():
         model_args=ModelArguments(model_name_or_path=None),
         strategy_args=StrategyArguments(strategy_name="hf_infer", strategy_config={}),
         world_size=world_size,
-        device_mapping=gpu_ids,
+        device_mapping=device_mapping_expr,
         system_envs={},
         infer_batch_size=args.batch_size,
     )
@@ -120,20 +126,28 @@ def main():
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         payload_width=args.payload_width,
+        payload_total_bytes=(
+            None if args.payload_total_mb is None else int(args.payload_total_mb * 1024 * 1024)
+        ),
     )
     result = cluster.transport_benchmark(batch, blocking=True)
 
     payload = result.batch["benchmark_output_payload"]
     input_summary = result.batch["benchmark_input_mb"]
+    effective_payload_width = payload_width_from_total_bytes(
+        total_bytes=int(args.payload_total_mb * 1024 * 1024),
+        batch_size=args.batch_size,
+    ) if args.payload_total_mb is not None else args.payload_width
     print("transport benchmark finished")
     print(f"use_tq={args.use_tq}")
     print(f"world_size={world_size}")
     print(f"rows={len(result)}")
+    print(f"payload_total_mb={args.payload_total_mb}")
+    print(f"effective_payload_width={effective_payload_width}")
     print(f"output_payload_shape={tuple(payload.shape)}")
     print(f"benchmark_input_mb_shape={tuple(input_summary.shape)}")
 
     resource_manager.destroy_placement_group()
-    ray.shutdown()
 
 
 if __name__ == "__main__":

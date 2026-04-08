@@ -32,11 +32,27 @@ def _make_payload(rows: int, payload_width: int, *, dtype=torch.float16) -> torc
     return torch.zeros((rows, payload_width), dtype=dtype)
 
 
+def payload_width_from_total_bytes(total_bytes: int, batch_size: int, *, dtype=torch.float16) -> int:
+    """Convert a desired total payload size into per-row width.
+
+    The benchmark payload is a dense tensor of shape [batch_size, payload_width].
+    This helper computes the smallest payload_width that reaches the requested
+    total bytes for the whole batch.
+    """
+    if total_bytes <= 0:
+        return 1
+    bytes_per_element = torch.tensor([], dtype=dtype).element_size()
+    bytes_per_row = max((total_bytes + batch_size - 1) // batch_size, 1)
+    width = (bytes_per_row + bytes_per_element - 1) // bytes_per_element
+    return max(int(width), 1)
+
+
 def build_transport_benchmark_batch(
     *,
     batch_size: int = 16,
     seq_len: int = 4096,
     payload_width: int = 4 * 1024 * 1024,
+    payload_total_bytes: int | None = None,
 ) -> DataProto:
     """Build a large synthetic batch for transport-only benchmarking.
 
@@ -47,7 +63,17 @@ def build_transport_benchmark_batch(
             transport payload. Larger values increase both dispatch and collect
             pressure. Since the worker echoes the payload back, the collect size
             matches the dispatched size.
+        payload_total_bytes: Optional target size for the whole payload tensor.
+            When provided, it overrides payload_width and computes the minimum
+            per-row width that reaches the requested total batch size.
     """
+    if payload_total_bytes is not None:
+        payload_width = payload_width_from_total_bytes(
+            total_bytes=payload_total_bytes,
+            batch_size=batch_size,
+            dtype=torch.float16,
+        )
+
     input_ids = torch.arange(seq_len, dtype=torch.int64).unsqueeze(0).repeat(batch_size, 1)
     attention_mask = torch.ones((batch_size, seq_len), dtype=torch.int64)
     position_ids = torch.arange(seq_len, dtype=torch.int64).unsqueeze(0).repeat(batch_size, 1)
