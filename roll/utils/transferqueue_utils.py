@@ -1,7 +1,7 @@
 """TransferQueue utilities for ROLL.
 
-Provides the @tqbridge decorator and BatchMeta/KVBatchMeta conversion tools,
-adapted from the TQ prototype integration.
+Provides the @tqbridge decorator and BatchMeta conversion tools, adapted from
+the TQ prototype integration.
 
 When TQ is not enabled, @tqbridge is effectively a no-op.
 All transfer_queue imports are lazy so this module remains safe to import
@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch
 from tensordict import TensorDict
@@ -35,7 +35,9 @@ TQ_INITIALIZED = False
 
 _tq_mod = None
 _BatchMeta_cls = None
-_KVBatchMeta_cls = None
+
+TQ_DISPATCH_TRACE_KEY = "_tq_dispatch_trace"
+TQ_COLLECT_TRACE_KEY = "_tq_collect_trace"
 
 
 def _calc_tensordict_size_mb(td) -> float:
@@ -60,21 +62,51 @@ def _get_process_rss_gb() -> float:
     return cpu_memory_info().rss / 1024**3
 
 
+def _clone_meta_info(meta_info):
+    return copy.deepcopy(meta_info) if meta_info else {}
+
+
+def _attach_trace(meta_info, trace_key: str, trace_payload: dict):
+    meta = _clone_meta_info(meta_info)
+    meta[trace_key] = copy.deepcopy(trace_payload)
+    return meta
+
+
+def _pop_trace(meta_info, trace_key: str):
+    if not meta_info:
+        return None
+    trace = meta_info.pop(trace_key, None)
+    return copy.deepcopy(trace) if isinstance(trace, dict) else None
+
+
+def _extract_first_trace_from_dataprotos(trace_key: str, *containers):
+    for container in containers:
+        if isinstance(container, dict):
+            iterable = container.values()
+        else:
+            iterable = container
+        for item in iterable:
+            if isinstance(item, DataProto):
+                trace = _pop_trace(item.meta_info, trace_key)
+                if trace is not None:
+                    return trace
+    return None
+
+
 def _ensure_tq_imports():
-    global _tq_mod, _BatchMeta_cls, _KVBatchMeta_cls
+    global _tq_mod, _BatchMeta_cls
     if _tq_mod is None:
         import transfer_queue
-        from transfer_queue import BatchMeta, KVBatchMeta
+        from transfer_queue import BatchMeta
 
         _tq_mod = transfer_queue
         _BatchMeta_cls = BatchMeta
-        _KVBatchMeta_cls = KVBatchMeta
-    return _tq_mod, _BatchMeta_cls, _KVBatchMeta_cls
+    return _tq_mod, _BatchMeta_cls
 
 
 def init_tq(config=None):
     """Initialize TransferQueue once in the current process."""
-    tq, _, _ = _ensure_tq_imports()
+    tq, _ = _ensure_tq_imports()
     global TQ_INITIALIZED
     if not TQ_INITIALIZED:
         tq.init(config)
@@ -117,19 +149,8 @@ def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> 
             thread.join()
 
 
-def _find_meta(*args, **kwargs):
-    _, BatchMeta, KVBatchMeta = _ensure_tq_imports()
-    for arg in args:
-        if isinstance(arg, (BatchMeta, KVBatchMeta)):
-            return arg
-    for value in kwargs.values():
-        if isinstance(value, (BatchMeta, KVBatchMeta)):
-            return value
-    return None
-
-
 def _find_batch_meta(*args, **kwargs):
-    _, BatchMeta, _ = _ensure_tq_imports()
+    _, BatchMeta = _ensure_tq_imports()
     for arg in args:
         if isinstance(arg, BatchMeta):
             return arg
@@ -210,7 +231,7 @@ def _placeholder_meta_info(meta):
 
 
 async def _async_meta_to_realdata(meta) -> TensorDict:
-    tq, _, _ = _ensure_tq_imports()
+    tq, _ = _ensure_tq_imports()
     meta = _normalize_batch_meta_size(meta)
     if meta.size == 0:
         return TensorDict({}, batch_size=(0,))
@@ -220,9 +241,6 @@ async def _async_meta_to_realdata(meta) -> TensorDict:
 
 
 def _meta_to_realdata(meta) -> TensorDict:
-    _, _, KVBatchMeta = _ensure_tq_imports()
-    if isinstance(meta, KVBatchMeta):
-        meta = kv_batch_meta2batch_meta(meta)
     meta = _normalize_batch_meta_size(meta)
     return _run_async_in_temp_loop(_async_meta_to_realdata, meta)
 
@@ -237,9 +255,6 @@ def _meta_to_dataproto(meta) -> DataProto:
 
 
 async def _async_meta_to_dataproto(meta) -> DataProto:
-    _, _, KVBatchMeta = _ensure_tq_imports()
-    if isinstance(meta, KVBatchMeta):
-        meta = await async_kv_batch_meta2batch_meta(meta)
     if _is_empty_batch_meta(meta):
         meta_info = _placeholder_meta_info(meta)
         return DataProto(batch=None, non_tensor_batch={}, meta_info=meta_info)
@@ -253,7 +268,7 @@ def meta_to_dataproto(meta) -> DataProto:
 
 
 async def _async_update_meta_with_output(output: TensorDict, meta, func_name=None):
-    tq, _, _ = _ensure_tq_imports()
+    tq, _ = _ensure_tq_imports()
     fields = [key for key, value in output.items() if isinstance(value, torch.Tensor)]
     if not fields:
         return meta
@@ -296,7 +311,7 @@ def _extract_writable_tensordict(output):
 
 
 def _empty_batch_meta():
-    _, BatchMeta, _ = _ensure_tq_imports()
+    _, BatchMeta = _ensure_tq_imports()
     meta = BatchMeta(global_indexes=[], partition_ids=[])
     return _normalize_batch_meta_size(meta)
 
@@ -309,67 +324,6 @@ def _postprocess_common(output, put_data, need_collect):
     if not put_data and not need_collect and isinstance(output, TensorDict):
         return TensorDict({}, batch_size=(0,))
     return output
-
-
-async def async_kv_batch_meta2batch_meta(meta):
-    tq, _, _ = _ensure_tq_imports()
-    global TQ_INITIALIZED
-    if not TQ_INITIALIZED:
-        tq.init()
-        TQ_INITIALIZED = True
-
-    tq_client = tq.get_client()
-    batch_meta = await tq_client.async_kv_retrieve_meta(
-        keys=meta.keys,
-        partition_id=meta.partition_id,
-        create=False,
-    )
-    fields = meta.fields
-    if fields is not None:
-        if isinstance(fields, str):
-            fields = [fields]
-        batch_meta = batch_meta.select_fields(fields)
-    batch_meta.extra_info = meta.extra_info
-    return batch_meta
-
-
-def kv_batch_meta2batch_meta(meta):
-    return _run_async_in_temp_loop(async_kv_batch_meta2batch_meta, meta)
-
-
-async def async_batch_meta2kv_batch_meta(meta):
-    tq, _, KVBatchMeta = _ensure_tq_imports()
-    global TQ_INITIALIZED
-    if not TQ_INITIALIZED:
-        tq.init()
-        TQ_INITIALIZED = True
-
-    tq_client = tq.get_client()
-    partition_id = meta.partition_ids[0]
-    assert all(partition_id == pid for pid in meta.partition_ids)
-    keys = await tq_client.async_kv_retrieve_keys(global_indexes=meta.global_indexes, partition_id=partition_id)
-    return KVBatchMeta(
-        keys=keys,
-        tags=[{}] * meta.size,
-        partition_id=partition_id,
-        fields=meta.field_names,
-        extra_info=meta.extra_info,
-    )
-
-
-def batch_meta2kv_batch_meta(meta):
-    return _run_async_in_temp_loop(async_batch_meta2kv_batch_meta, meta)
-
-
-def kv_batch_meta_put_tensordict(meta, td: TensorDict, func_name: str = "kv_batch_meta_put_tensordict"):
-    if td is None or not td.batch_size or td.batch_size[0] == 0:
-        return meta
-    batch_meta = kv_batch_meta2batch_meta(meta)
-    updated_batch_meta = _update_meta_with_output(td, batch_meta, func_name)
-    updated_kv_meta = batch_meta2kv_batch_meta(updated_batch_meta)
-    meta.fields = list(updated_kv_meta.fields) if updated_kv_meta.fields is not None else []
-    meta.extra_info = updated_kv_meta.extra_info
-    return meta
 
 
 def tqbridge(dispatch_mode=None):
@@ -413,7 +367,7 @@ def tqbridge(dispatch_mode=None):
             n_rows = getattr(io_meta, 'size', len(getattr(io_meta, 'global_indexes', [])))
 
             # Worker side: TQ READ
-            logger.info(
+            logger.debug(
                 f"[TQ worker] {func.__name__} | READ TRIGGERED | rows={n_rows} "
                 f"(BatchMeta received instead of DataProto via Ray)"
             )
@@ -432,10 +386,21 @@ def tqbridge(dispatch_mode=None):
                         if hasattr(v, 'nbytes'):
                             read_data_mb += v.nbytes
             read_data_mb /= (1024 * 1024)
-            logger.info(
+            dispatch_trace = _extract_first_trace_from_dataprotos(
+                TQ_DISPATCH_TRACE_KEY, args, kwargs
+            )
+            logger.debug(
                 f"[TQ worker] {func.__name__} | READ DONE | rows={n_rows} "
                 f"| data={read_data_mb:.2f}MB | TQ read cost={read_cost:.3f}s"
             )
+            if dispatch_trace is not None and not is_placeholder_input:
+                e2e_total = max(0.0, time.time() - dispatch_trace["dispatch_started_at"])
+                logger.info(
+                    f"[TQ dispatch E2E] {func.__name__} | trace_id={dispatch_trace['trace_id']} "
+                    f"| rows={n_rows} | data={read_data_mb:.2f}MB | total={e2e_total:.3f}s "
+                    f"| driver_put={dispatch_trace['driver_put_cost']:.3f}s "
+                    f"| worker_read={read_cost:.3f}s"
+                )
 
             output = func(*args, **kwargs)
 
@@ -458,15 +423,26 @@ def tqbridge(dispatch_mode=None):
                 write_data_mb = sum(
                     v.nbytes for v in writable_td.values() if hasattr(v, 'nbytes')
                 ) / (1024 * 1024)
-                logger.info(
+                logger.debug(
                     f"[TQ worker] {func.__name__} | WRITE TRIGGERED | rows={writable_td.batch_size[0]} "
                     f"| data={write_data_mb:.2f}MB (writing output back to TQ instead of Ray)"
                 )
                 t_write = time.time()
+                output.meta_info = _attach_trace(
+                    output.meta_info,
+                    TQ_COLLECT_TRACE_KEY,
+                    {
+                        "trace_id": uuid.uuid4().hex[:12],
+                        "worker_write_started_at": t_write,
+                        "worker_name": func.__name__,
+                        "rows": writable_td.batch_size[0],
+                        "data_mb": write_data_mb,
+                    },
+                )
                 io_meta = _apply_output_extra_info(io_meta, output)
                 result = _update_meta_with_output(writable_td, io_meta, func.__name__)
                 write_cost = time.time() - t_write
-                logger.info(
+                logger.debug(
                     f"[TQ worker] {func.__name__} | WRITE DONE | data={write_data_mb:.2f}MB "
                     f"| TQ write cost={write_cost:.3f}s"
                 )
@@ -507,7 +483,7 @@ def tqbridge(dispatch_mode=None):
             n_rows = getattr(io_meta, 'size', len(getattr(io_meta, 'global_indexes', [])))
 
             # Worker side: TQ READ (async)
-            logger.info(
+            logger.debug(
                 f"[TQ worker] {func.__name__} | READ TRIGGERED | rows={n_rows} "
                 f"(BatchMeta received instead of DataProto via Ray)"
             )
@@ -528,10 +504,21 @@ def tqbridge(dispatch_mode=None):
                         if hasattr(v, 'nbytes'):
                             read_data_mb += v.nbytes
             read_data_mb /= (1024 * 1024)
-            logger.info(
+            dispatch_trace = _extract_first_trace_from_dataprotos(
+                TQ_DISPATCH_TRACE_KEY, args, kwargs
+            )
+            logger.debug(
                 f"[TQ worker] {func.__name__} | READ DONE | rows={n_rows} "
                 f"| data={read_data_mb:.2f}MB | TQ read cost={read_cost:.3f}s"
             )
+            if dispatch_trace is not None and not is_placeholder_input:
+                e2e_total = max(0.0, time.time() - dispatch_trace["dispatch_started_at"])
+                logger.info(
+                    f"[TQ dispatch E2E] {func.__name__} | trace_id={dispatch_trace['trace_id']} "
+                    f"| rows={n_rows} | data={read_data_mb:.2f}MB | total={e2e_total:.3f}s "
+                    f"| driver_put={dispatch_trace['driver_put_cost']:.3f}s "
+                    f"| worker_read={read_cost:.3f}s"
+                )
 
             output = await func(*args, **kwargs)
 
@@ -553,15 +540,26 @@ def tqbridge(dispatch_mode=None):
                 write_data_mb = sum(
                     v.nbytes for v in writable_td.values() if hasattr(v, 'nbytes')
                 ) / (1024 * 1024)
-                logger.info(
+                logger.debug(
                     f"[TQ worker] {func.__name__} | WRITE TRIGGERED | rows={writable_td.batch_size[0]} "
                     f"| data={write_data_mb:.2f}MB (writing output back to TQ instead of Ray)"
                 )
                 t_write = time.time()
+                output.meta_info = _attach_trace(
+                    output.meta_info,
+                    TQ_COLLECT_TRACE_KEY,
+                    {
+                        "trace_id": uuid.uuid4().hex[:12],
+                        "worker_write_started_at": t_write,
+                        "worker_name": func.__name__,
+                        "rows": writable_td.batch_size[0],
+                        "data_mb": write_data_mb,
+                    },
+                )
                 io_meta = _apply_output_extra_info(io_meta, output)
                 result = await _async_update_meta_with_output(writable_td, io_meta, func.__name__)
                 write_cost = time.time() - t_write
-                logger.info(
+                logger.debug(
                     f"[TQ worker] {func.__name__} | WRITE DONE | data={write_data_mb:.2f}MB "
                     f"| TQ write cost={write_cost:.3f}s"
                 )
@@ -571,38 +569,3 @@ def tqbridge(dispatch_mode=None):
         return async_inner if inspect.iscoroutinefunction(func) else inner
 
     return decorator
-
-
-def dataproto_to_kv_batch_meta(
-    data: DataProto,
-    partition_id: str = "train",
-    key_prefix: str = "",
-    tags: Optional[List[dict]] = None,
-):
-    """Write a DataProto batch into TQ and return a KVBatchMeta handle."""
-    tq, _, KVBatchMeta = _ensure_tq_imports()
-    global TQ_INITIALIZED
-    if not TQ_INITIALIZED:
-        tq.init()
-        TQ_INITIALIZED = True
-
-    batch_size = len(data)
-    keys = [f"{key_prefix}{uuid.uuid4().hex}" for _ in range(batch_size)]
-    if tags is None:
-        tags = [{} for _ in range(batch_size)]
-
-    if data.batch is not None and data.batch.batch_size[0] > 0:
-        tq.kv_batch_put(
-            keys=keys,
-            fields=data.batch,
-            tags=tags,
-            partition_id=partition_id,
-        )
-
-    return KVBatchMeta(
-        keys=keys,
-        tags=tags,
-        partition_id=partition_id,
-        fields=list(data.batch.keys()) if data.batch is not None else [],
-        extra_info=_pack_extra_info(data.meta_info, data.non_tensor_batch),
-    )

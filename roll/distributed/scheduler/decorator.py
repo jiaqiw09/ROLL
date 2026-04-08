@@ -14,6 +14,8 @@ import ray
 import torch
 import asyncio
 import copy
+import time
+import uuid
 
 from roll.distributed.scheduler.protocol import DataProto, ObjectRefWrap
 from roll.utils.logging import get_logger
@@ -172,17 +174,18 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
             """Write *data* to TQ and return a list of dp_size BatchMeta shards."""
             import asyncio
             import copy
-            import time
 
             td = data.batch  # TensorDict
-            meta_info = data.meta_info
+            meta_info = copy.deepcopy(data.meta_info)
             non_tensor_batch = data.non_tensor_batch
 
             data_mb = _calc_tensordict_size_mb(td)
             n_rows = td.batch_size[0] if td.batch_size else 0
-            logger.info(
-                f"[TQ dispatch] TRIGGERED | rows={n_rows} | tensor_data={data_mb:.2f}MB "
-                f"(this would have gone through Ray) | dp_size={dp_size}"
+            trace_id = uuid.uuid4().hex[:12]
+            dispatch_started_at = time.time()
+            logger.debug(
+                f"[TQ dispatch] TRIGGERED | trace_id={trace_id} | rows={n_rows} "
+                f"| tensor_data={data_mb:.2f}MB | dp_size={dp_size}"
             )
 
             def _run(coro):
@@ -193,16 +196,30 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
                     loop.close()
 
             t0 = time.time()
-            from roll.utils.transferqueue_utils import _pack_extra_info
+            from roll.utils.transferqueue_utils import (
+                TQ_DISPATCH_TRACE_KEY, _attach_trace, _pack_extra_info,
+            )
             full_meta = _run(tq_client.async_put(
                 data=td,
                 metadata=None,
                 partition_id=TQ_DISPATCH_PARTITION_ID,
             ))
-            full_meta.extra_info = _pack_extra_info(meta_info, non_tensor_batch)
             tq_cost = time.time() - t0
-            logger.info(
-                f"[TQ dispatch] PUT DONE | rows={n_rows} | data={data_mb:.2f}MB "
+            meta_info = _attach_trace(
+                meta_info,
+                TQ_DISPATCH_TRACE_KEY,
+                {
+                    "trace_id": trace_id,
+                    "dispatch_started_at": dispatch_started_at,
+                    "driver_put_cost": tq_cost,
+                    "rows": n_rows,
+                    "data_mb": data_mb,
+                    "dp_size": dp_size,
+                },
+            )
+            full_meta.extra_info = _pack_extra_info(meta_info, non_tensor_batch)
+            logger.debug(
+                f"[TQ dispatch] PUT DONE | trace_id={trace_id} | rows={n_rows} | data={data_mb:.2f}MB "
                 f"| TQ write cost={tq_cost:.3f}s | Ray would have serialized ~{data_mb:.2f}MB on copy"
             )
 
@@ -223,6 +240,7 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
 
             for dp_rank, shard_data in enumerate(dp_shards):
                 shard_rows = len(shard_data)
+                shard_data_mb = _calc_dataproto_size_mb(shard_data)
                 end = start + shard_rows
                 shard_idx = all_idx[start:end]
                 shard_partition_ids = _slice_partition_ids(end, shard_rows)
@@ -230,16 +248,26 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
                 shard_meta.global_indexes = shard_idx
                 shard_meta.partition_ids = shard_partition_ids
                 _set_batchmeta_row_count(shard_meta, shard_rows)
-                shard_meta.extra_info = _pack_extra_info(
+                shard_meta_info = _attach_trace(
                     shard_data.meta_info,
+                    TQ_DISPATCH_TRACE_KEY,
+                    {
+                        "trace_id": trace_id,
+                        "dispatch_started_at": dispatch_started_at,
+                        "driver_put_cost": tq_cost,
+                        "rows": shard_rows,
+                        "data_mb": shard_data_mb,
+                        "dp_size": dp_size,
+                    },
+                )
+                shard_meta.extra_info = _pack_extra_info(
+                    shard_meta_info,
                     shard_data.non_tensor_batch,
                 )
-                logger.info(
-                    f"[TQ dispatch] SHARD READY | dp_rank={dp_rank} | rows={shard_rows} "
+                logger.debug(
+                    f"[TQ dispatch] SHARD READY | trace_id={trace_id} | dp_rank={dp_rank} | rows={shard_rows} "
                     f"| indexes={len(shard_idx)} | partition_ids={len(shard_partition_ids)} "
-                    f"| meta_size={getattr(shard_meta, 'size', None)} "
-                    f"| fields={getattr(shard_meta, 'field_names', None)} "
-                    f"| non_tensor_keys={list(shard_data.non_tensor_batch.keys())}"
+                    f"| meta_size={getattr(shard_meta, 'size', None)}"
                 )
                 shards.append(shard_meta)
                 start = end
@@ -386,18 +414,24 @@ def collect_dp_mp_compute(cluster, output):
         from transfer_queue import BatchMeta as _BatchMeta
         # Check if results are BatchMeta (TQ path)
         if rep_results and isinstance(rep_results[0], _BatchMeta):
-            import time
-            from roll.utils.transferqueue_utils import _meta_to_dataproto, _split_extra_info
+            from roll.utils.transferqueue_utils import (
+                TQ_COLLECT_TRACE_KEY, _meta_to_dataproto, _pop_trace, _split_extra_info,
+            )
 
             # Merge global_indexes from all dp representative ranks
             merged_idx = []
             merged_partition_ids = []
             extra_info = None
+            collect_traces = []
             for meta in rep_results:
                 merged_idx.extend(list(meta.global_indexes))
                 merged_partition_ids.extend(list(meta.partition_ids))
                 if extra_info is None:
                     extra_info = getattr(meta, "extra_info", None)
+                meta_info, _ = _split_extra_info(getattr(meta, "extra_info", None))
+                trace = meta_info.get(TQ_COLLECT_TRACE_KEY)
+                if isinstance(trace, dict):
+                    collect_traces.append(trace)
 
             import copy
 
@@ -411,7 +445,7 @@ def collect_dp_mp_compute(cluster, output):
             if extra_info is not None:
                 merged_meta.extra_info = extra_info
 
-            logger.info(
+            logger.debug(
                 f"[TQ collect] TRIGGERED | merging {len(rep_results)} dp ranks "
                 f"| total rows={len(merged_idx)}"
             )
@@ -426,11 +460,23 @@ def collect_dp_mp_compute(cluster, output):
                     if hasattr(v, 'nbytes'):
                         result_mb += v.nbytes
                 result_mb /= (1024 * 1024)
-            logger.info(
-                f"[TQ collect] GET DONE | rows={len(merged_idx)} | data={result_mb:.2f}MB "
-                f"| TQ read cost={tq_cost:.3f}s | rss={_get_process_rss_gb():.3f}GB "
-                f"(without TQ, Ray would have returned ~{result_mb:.2f}MB from {len(rep_results)} workers)"
-            )
+            collect_trace = _pop_trace(result.meta_info, TQ_COLLECT_TRACE_KEY)
+            if collect_trace is not None or collect_traces:
+                trace_group = collect_traces or [collect_trace]
+                valid_traces = [trace for trace in trace_group if isinstance(trace, dict)]
+                first_write_started_at = min(trace["worker_write_started_at"] for trace in valid_traces)
+                worker_name = valid_traces[0].get("worker_name", "unknown")
+                e2e_total = max(0.0, time.time() - first_write_started_at)
+                logger.info(
+                    f"[TQ collect E2E] {worker_name} | traces={len(valid_traces)} "
+                    f"| rows={len(merged_idx)} | data={result_mb:.2f}MB | total={e2e_total:.3f}s "
+                    f"| driver_get={tq_cost:.3f}s"
+                )
+            else:
+                logger.info(
+                    f"[TQ collect E2E] rows={len(merged_idx)} | data={result_mb:.2f}MB "
+                    f"| driver_get={tq_cost:.3f}s | rss={_get_process_rss_gb():.3f}GB"
+                )
 
             return result
 
