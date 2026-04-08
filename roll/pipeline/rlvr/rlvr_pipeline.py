@@ -506,18 +506,55 @@ class RLVRPipeline(BasePipeline):
                     actor_infer_response_timer,
                     Timer(name="step_generate", logger=None) as step_generate_timer,
                 ):
+                    def _calc_dataproto_size_mb(data: DataProto) -> float:
+                        if data is None or data.batch is None:
+                            return 0.0
+                        total = 0
+                        for value in data.batch.values():
+                            if hasattr(value, "nbytes"):
+                                total += value.nbytes
+                        return total / (1024 * 1024)
+
                     domain_batches = {}
                     scheduler_refs = {}
+                    use_tq = (
+                        getattr(self.pipeline_config, "transfer_queue", None) is not None
+                        and getattr(self.pipeline_config.transfer_queue, "enable", False)
+                    )
                     for domain, scheduler in self.generate_schedulers.items():
                         scheduler_refs[domain] = scheduler.get_batch.remote(
-                            data=batch, global_step=global_step, batch_size=self.domain_batch_size[domain]
+                            data=batch,
+                            global_step=global_step,
+                            batch_size=self.domain_batch_size[domain],
+                            return_batch_meta=use_tq,
                         )
-                    for domain, scheduler_ref in scheduler_refs.items():
-                        domain_batch: DataProto = ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout)
+
+                    domain_names = list(scheduler_refs.keys())
+                    t0 = time.time()
+                    fetched_batches = ray.get(list(scheduler_refs.values()), timeout=self.pipeline_config.rpc_timeout)
+                    ray_get_cost = time.time() - t0
+
+                    if use_tq:
+                        from roll.utils.transferqueue_utils import meta_to_dataproto
+
+                        fetched_batches = [meta_to_dataproto(batch_meta) for batch_meta in fetched_batches]
+
+                    total_batch_mb = 0.0
+                    for domain, domain_batch in zip(domain_names, fetched_batches):
+                        batch_mb = _calc_dataproto_size_mb(domain_batch)
+                        total_batch_mb += batch_mb
+                        logger.info(
+                            f"[generate collect] domain={domain} | payload={batch_mb:.2f}MB "
+                            f"| rows={domain_batch.batch.batch_size[0] if domain_batch.batch is not None else 0}"
+                        )
                         metrics_mgr.add_domain_metrics(
                             domain, reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         )
                         domain_batches[domain] = domain_batch
+                    logger.info(
+                        f"[generate collect] ray.get domains={len(domain_names)} "
+                        f"| total_payload={total_batch_mb:.2f}MB | cost={ray_get_cost:.3f}s"
+                    )
                     generate_output = DataProto.concat([domain_batch for domain_batch in domain_batches.values()])
                     dump_rollout_to_specific_path(self.pipeline_config.rollout_dump_dir, global_step, generate_output, self.tokenizer)
                     generate_output.meta_info.pop("is_offload_states", None)

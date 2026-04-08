@@ -27,6 +27,7 @@ from megatron.core.tensor_parallel import (
     reduce_from_tensor_model_parallel_region,
 )
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_moe_layer_wise_logging_tracker,
@@ -95,14 +96,36 @@ class MegatronInferStrategy(InferenceStrategy):
         # than in pipeline_config (PPOConfig)
         config_dict.update({"max_grad_norm": self.worker.pipeline_config.max_grad_norm})
         config_dict.setdefault("lr_scheduler_kwargs", {})
+        if self._should_force_local_reference_backend():
+            # The reference log-prob path on Ascend is latency tolerant, so we
+            # prefer the local Megatron implementation over TE/FA to avoid
+            # asynchronous aclnnFlashAttentionScore failures.
+            config_dict["transformer_impl"] = "local"
         logger.info(f"training_args: {config_dict}")
         self.megatron_train_args = TrainingArguments(**config_dict)
+        if self._should_force_local_reference_backend():
+            additional_configs = self.megatron_train_args.additional_configs or {}
+            additional_configs["attention_backend"] = AttnBackend.local
+            self.megatron_train_args.additional_configs = additional_configs
+            for env_name in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+                os.environ[env_name] = "0"
+            logger.warning(
+                "Force local transformer/attention backend for the NPU reference worker "
+                "to avoid unstable FlashAttention execution in compute_log_probs."
+            )
         self.model = None
         self.forward_backward_func = None
         self.seq_length = None
         self.use_sequence_packing = self.worker_config.use_sequence_packing
         # hard to impl with offload states
         assert not self.megatron_train_args.overlap_param_gather, "overlap_param_gather is not supported"
+
+    def _should_force_local_reference_backend(self) -> bool:
+        return (
+            self.worker_config.name == "reference"
+            and hasattr(torch, "npu")
+            and torch.npu.is_available()
+        )
 
     def initialize(self, model_provider):
         self.tokenizer = default_tokenizer_provider(model_args=self.worker_config.model_args)
@@ -422,13 +445,23 @@ class MegatronInferStrategy(InferenceStrategy):
         else:
             input_ids = self._get_feature_on_this_cp_rank(input_ids, "input_ids")
             attention_mask = self._get_feature_on_this_cp_rank(attention_mask, "attention_mask")
-            
             if hasattr(torch, "npu") and torch.npu.is_available() and attention_mask is not None:
                 attention_mask = attention_mask.bool()
+
+            # Keep the text-only Megatron path on NPU aligned with the default
+            # 2D mask behavior. Expanding to a 4D mask here can trip Ascend FA
+            # kernels during reference/log-prob computation. VLM batches still
+            # use the legacy 4D mask path when multimodal inputs are present.
+            if (
+                hasattr(torch, "npu")
+                and torch.npu.is_available()
+                and attention_mask is not None
+                and "multi_modal_inputs" in data.non_tensor_batch
+            ):
                 B, S = attention_mask.shape
                 attention_mask = attention_mask[:, None, None, :]   # [B,1,1,S]
                 attention_mask = attention_mask.expand(B, 1, S, S)        # [B,1,S,S]
-            
+
             if labels is not None:
                 labels = self._get_feature_on_this_cp_rank(labels, "labels")
         position_ids = None

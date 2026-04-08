@@ -2,11 +2,11 @@ import json
 from dataclasses import dataclass, field, fields
 from typing import Literal, Optional, Union
 
-try:
-    # NPU patch
-    import mindspeed.megatron_adaptor
-except ImportError:
-    pass
+# try:
+#     # NPU patch
+#     import mindspeed.megatron_adaptor
+# except ImportError:
+#     pass
 
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from transformers import Seq2SeqTrainingArguments as HFSeq2SeqTrainingArguments

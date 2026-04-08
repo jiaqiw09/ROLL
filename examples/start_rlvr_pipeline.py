@@ -1,6 +1,9 @@
 import argparse
 import os
 
+os.environ["TORCH_EXTENSIONS_DIR"] = "/tmp/torch_extensions"
+os.makedirs("/tmp/torch_extensions", exist_ok=True)
+
 from dacite import from_dict, Config
 from hydra.experimental import compose, initialize
 from omegaconf import OmegaConf

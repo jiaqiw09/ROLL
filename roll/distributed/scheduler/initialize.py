@@ -62,7 +62,10 @@ def init():
     manual_start = start_ray_cluster()
 
     runtime_env = {
-        "env_vars": current_platform.get_custom_env_vars(),
+        "env_vars": {
+            **current_platform.get_custom_env_vars(),
+            "TORCH_EXTENSIONS_DIR": os.environ.get("TORCH_EXTENSIONS_DIR", "/tmp/torch_extensions"),
+        },
     }
 
     if not ray.is_initialized():

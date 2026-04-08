@@ -13,6 +13,7 @@ from more_itertools import chunked
 import ray
 import torch
 import asyncio
+import copy
 
 from roll.distributed.scheduler.protocol import DataProto, ObjectRefWrap
 from roll.utils.logging import get_logger
@@ -21,17 +22,51 @@ from roll.platforms import current_platform
 logger = get_logger()
 
 BIND_WORKER_METHOD_FLAG = "BIND_WORKER_METHOD_FLAG"
+TQ_DISPATCH_PARTITION_ID = "train_dispatch"
+
+
+def _calc_tensordict_size_mb(td) -> float:
+    total = 0
+    if td is None:
+        return 0.0
+    for value in td.values():
+        if hasattr(value, "nbytes"):
+            total += value.nbytes
+    return total / (1024 * 1024)
+
+
+def _calc_dataproto_size_mb(data) -> float:
+    if not isinstance(data, DataProto):
+        return 0.0
+    return _calc_tensordict_size_mb(data.batch)
+
+
+def _get_process_rss_gb() -> float:
+    from roll.utils.context_managers import cpu_memory_info
+
+    return cpu_memory_info().rss / 1024**3
+
+
+def _set_batchmeta_row_count(meta, rows: int) -> None:
+    """Best-effort sync of row-count fields used by TransferQueue metadata."""
+    for attr_name in ("size", "_size"):
+        try:
+            setattr(meta, attr_name, rows)
+        except Exception:
+            pass
 
 
 def _is_tq_enabled(cluster) -> bool:
-    """Return True if TransferQueue is enabled for this cluster's pipeline."""
-    pipeline_config = getattr(cluster, "pipeline_config", None)
-    if pipeline_config is None:
-        return False
-    tq_conf = getattr(pipeline_config, "transfer_queue", None)
-    if tq_conf is None:
-        return False
-    return getattr(tq_conf, "enable", False)
+    """Return True if TransferQueue is enabled in the current process.
+
+    TQ is configured once at pipeline level, then initialized per process
+    (driver / scheduler / worker). Dispatch and collect happen on the driver
+    side, so they should check the driver's TQ runtime state instead of
+    depending on whether the Cluster wrapper happens to carry pipeline_config.
+    """
+    from roll.utils.transferqueue_utils import is_tq_runtime_enabled
+
+    return is_tq_runtime_enabled()
 
 
 class Dispatch(Enum):
@@ -133,24 +168,17 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
         import transfer_queue as tq_mod
         tq_client = tq_mod.get_client()
 
-        def _calc_size_mb(td) -> float:
-            """Approximate serialized size of a TensorDict in MB."""
-            total = 0
-            for v in td.values():
-                if hasattr(v, 'nbytes'):
-                    total += v.nbytes
-            return total / (1024 * 1024)
-
         def _dataproto_to_batchmeta_shards(data: DataProto, dp_size: int):
             """Write *data* to TQ and return a list of dp_size BatchMeta shards."""
             import asyncio
+            import copy
             import time
 
             td = data.batch  # TensorDict
             meta_info = data.meta_info
             non_tensor_batch = data.non_tensor_batch
 
-            data_mb = _calc_size_mb(td)
+            data_mb = _calc_tensordict_size_mb(td)
             n_rows = td.batch_size[0] if td.batch_size else 0
             logger.info(
                 f"[TQ dispatch] TRIGGERED | rows={n_rows} | tensor_data={data_mb:.2f}MB "
@@ -169,6 +197,7 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
             full_meta = _run(tq_client.async_put(
                 data=td,
                 metadata=None,
+                partition_id=TQ_DISPATCH_PARTITION_ID,
             ))
             full_meta.extra_info = _pack_extra_info(meta_info, non_tensor_batch)
             tq_cost = time.time() - t0
@@ -177,17 +206,49 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
                 f"| TQ write cost={tq_cost:.3f}s | Ray would have serialized ~{data_mb:.2f}MB on copy"
             )
 
-            # Split global_indexes across dp_size shards
+            # Keep TQ shard boundaries aligned with DataProto.chunk(), so tensor rows,
+            # non_tensor_batch rows and meta extra_info all describe the same slice.
+            dp_shards = data.chunk(chunks=dp_size)
             all_idx = list(full_meta.global_indexes)
-            shard_size = (len(all_idx) + dp_size - 1) // dp_size
+            all_partition_ids = list(full_meta.partition_ids)
             shards = []
-            for dp_rank in range(dp_size):
-                start = dp_rank * shard_size
-                end = min(start + shard_size, len(all_idx))
+            start = 0
+
+            def _slice_partition_ids(end: int, shard_rows: int):
+                if shard_rows == 0 or len(all_partition_ids) == 0:
+                    return []
+                if len(all_partition_ids) == 1:
+                    return all_partition_ids * shard_rows
+                return all_partition_ids[start:end]
+
+            for dp_rank, shard_data in enumerate(dp_shards):
+                shard_rows = len(shard_data)
+                end = start + shard_rows
                 shard_idx = all_idx[start:end]
-                shard_meta = type(full_meta)(global_indexes=shard_idx, partition_ids=full_meta.partition_ids)
-                shard_meta.extra_info = full_meta.extra_info
+                shard_partition_ids = _slice_partition_ids(end, shard_rows)
+                shard_meta = copy.deepcopy(full_meta)
+                shard_meta.global_indexes = shard_idx
+                shard_meta.partition_ids = shard_partition_ids
+                _set_batchmeta_row_count(shard_meta, shard_rows)
+                shard_meta.extra_info = _pack_extra_info(
+                    shard_data.meta_info,
+                    shard_data.non_tensor_batch,
+                )
+                logger.info(
+                    f"[TQ dispatch] SHARD READY | dp_rank={dp_rank} | rows={shard_rows} "
+                    f"| indexes={len(shard_idx)} | partition_ids={len(shard_partition_ids)} "
+                    f"| meta_size={getattr(shard_meta, 'size', None)} "
+                    f"| fields={getattr(shard_meta, 'field_names', None)} "
+                    f"| non_tensor_keys={list(shard_data.non_tensor_batch.keys())}"
+                )
                 shards.append(shard_meta)
+                start = end
+
+            if start != len(all_idx):
+                logger.warning(
+                    f"[TQ dispatch] shard index accounting mismatch: consumed={start}, "
+                    f"available={len(all_idx)}, dp_size={dp_size}"
+                )
             return shards
 
         # Replace DataProto positional args with BatchMeta shard lists
@@ -212,8 +273,16 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
         def _get_tq_arg(arg_list, rank_info):
             shard = arg_list[rank_info.dp_rank]
             if _dispatch_first and not (rank_info.tp_rank == 0 and rank_info.cp_rank == 0 and rank_info.pp_rank == 0):
-                # Non-primary rank: send empty BatchMeta (tqbridge will skip TQ read)
-                empty = _BatchMeta(global_indexes=[], partition_ids=[])
+                # Non-primary rank: send an empty BatchMeta placeholder, but keep
+                # extra_info so tqbridge can restore the original DataProto meta_info.
+                empty = copy.deepcopy(shard)
+                empty.global_indexes = []
+                empty.partition_ids = []
+                for attr_name in ("size", "_size"):
+                    try:
+                        setattr(empty, attr_name, 0)
+                    except Exception:
+                        pass
                 return empty
             return shard
 
@@ -229,6 +298,14 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
 
     # ---- original path (no TQ) ----
     splitted_args, splitted_kwargs = _split_args_kwargs(cluster.dp_size, *args, **kwargs)
+    for arg in args:
+        if isinstance(arg, DataProto):
+            rows = arg.batch.batch_size[0] if arg.batch is not None else 0
+            data_mb = _calc_dataproto_size_mb(arg)
+            logger.info(
+                f"[NO TQ dispatch] TRIGGERED | rows={rows} | tensor_data={data_mb:.2f}MB "
+                f"| dp_size={cluster.dp_size} | ray_payload={data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
+            )
     all_args = []
 
     def get_arg_by_rank_info(arg, rank_info):
@@ -286,8 +363,15 @@ def collect_dp_mp_compute(cluster, output):
     is_refs = isinstance(output[0], ray.ObjectRef) if output else False
     if is_refs:
         import os, ray as _ray
+        import time
         timeout = int(os.environ.get("roll_RPC_TIMEOUT", 3600))
+        t0 = time.time()
         raw_output = _ray.get(list(output), timeout=timeout)
+        ray_get_cost = time.time() - t0
+        logger.info(
+            f"[NO TQ collect] ray.get DONE | world_size={cluster.world_size} "
+            f"| cost={ray_get_cost:.3f}s | rss={_get_process_rss_gb():.3f}GB"
+        )
 
     # Identify representative ranks
     rep_results = []
@@ -315,10 +399,15 @@ def collect_dp_mp_compute(cluster, output):
                 if extra_info is None:
                     extra_info = getattr(meta, "extra_info", None)
 
-            merged_meta = _BatchMeta(
-                global_indexes=merged_idx,
-                partition_ids=merged_partition_ids,
+            import copy
+
+            merged_meta = copy.deepcopy(rep_results[0]) if rep_results else _BatchMeta(
+                global_indexes=[],
+                partition_ids=[],
             )
+            merged_meta.global_indexes = merged_idx
+            merged_meta.partition_ids = merged_partition_ids
+            _set_batchmeta_row_count(merged_meta, len(merged_idx))
             if extra_info is not None:
                 merged_meta.extra_info = extra_info
 
@@ -339,7 +428,7 @@ def collect_dp_mp_compute(cluster, output):
                 result_mb /= (1024 * 1024)
             logger.info(
                 f"[TQ collect] GET DONE | rows={len(merged_idx)} | data={result_mb:.2f}MB "
-                f"| TQ read cost={tq_cost:.3f}s "
+                f"| TQ read cost={tq_cost:.3f}s | rss={_get_process_rss_gb():.3f}GB "
                 f"(without TQ, Ray would have returned ~{result_mb:.2f}MB from {len(rep_results)} workers)"
             )
 
@@ -362,6 +451,12 @@ def collect_dp_mp_compute(cluster, output):
     if isinstance(rep_results[0], list):
         return list(chain.from_iterable(rep_results))
     elif isinstance(rep_results[0], DataProto):
+        result_mb = sum(_calc_dataproto_size_mb(result) for result in rep_results)
+        total_rows = sum(result.batch.batch_size[0] for result in rep_results if result.batch is not None)
+        logger.info(
+            f"[NO TQ collect] CONCAT TRIGGERED | dp_results={len(rep_results)} "
+            f"| total_rows={total_rows} | data={result_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
+        )
         return DataProto.concat(rep_results)
     else:
         raise NotImplementedError(f"output type {type(rep_results[0])}")

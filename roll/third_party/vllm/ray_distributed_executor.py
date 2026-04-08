@@ -86,17 +86,29 @@ class CustomRayDistributedExecutor(RayDistributedExecutor):
             env_vars.update(roll_current_platform.get_custom_env_vars())
             env_vars.update(roll_current_platform.get_vllm_run_time_env_vars(gpu_rank))
             runtime_env = RuntimeEnv(env_vars=env_vars)
-            assert current_platform.ray_device_key == "GPU"
-            # NV+AMD GPUs, and Intel XPUs
-            worker = ray.remote(
-                num_cpus=0,
-                num_gpus=0.01,
-                runtime_env=runtime_env,
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                ),
-                **ray_remote_kwargs,
-            )(RayWorkerWrapper).remote(rpc_rank=rank)
+            if current_platform.ray_device_key == "GPU":
+                worker = ray.remote(
+                    num_cpus=0,
+                    num_gpus=0.01,
+                    runtime_env=runtime_env,
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                    ),
+                    **ray_remote_kwargs,
+                )(RayWorkerWrapper).remote(rpc_rank=rank)
+            elif current_platform.ray_device_key == "NPU":
+                worker = ray.remote(
+                    num_cpus=0,
+                    num_gpus=0,
+                    resources={current_platform.ray_device_key: 0.01},
+                    runtime_env=runtime_env,
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                    ),
+                    **ray_remote_kwargs,
+                )(RayWorkerWrapper).remote(rpc_rank=rank)
+            else:
+                raise ValueError(f"Unsupported platform: {current_platform.ray_device_key}")
             worker_metadata.append(RayWorkerMetaData(worker=worker, created_rank=rank))
 
         worker_ips = ray.get(

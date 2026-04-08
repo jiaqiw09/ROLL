@@ -38,6 +38,28 @@ _BatchMeta_cls = None
 _KVBatchMeta_cls = None
 
 
+def _calc_tensordict_size_mb(td) -> float:
+    total = 0
+    if td is None:
+        return 0.0
+    for value in td.values():
+        if hasattr(value, "nbytes"):
+            total += value.nbytes
+    return total / (1024 * 1024)
+
+
+def _calc_dataproto_size_mb(data) -> float:
+    if not isinstance(data, DataProto):
+        return 0.0
+    return _calc_tensordict_size_mb(data.batch)
+
+
+def _get_process_rss_gb() -> float:
+    from roll.utils.context_managers import cpu_memory_info
+
+    return cpu_memory_info().rss / 1024**3
+
+
 def _ensure_tq_imports():
     global _tq_mod, _BatchMeta_cls, _KVBatchMeta_cls
     if _tq_mod is None:
@@ -57,6 +79,17 @@ def init_tq(config=None):
     if not TQ_INITIALIZED:
         tq.init(config)
         TQ_INITIALIZED = True
+
+
+def is_tq_runtime_enabled() -> bool:
+    """Return whether TransferQueue has been enabled in the current process.
+
+    This is the runtime single source of truth used by dispatch/collect paths.
+    Once `init_tq(...)` succeeds in a process, all supported call sites in that
+    process should consistently consider TQ enabled, without depending on which
+    wrapper object they were called through.
+    """
+    return TQ_INITIALIZED
 
 
 def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> Any:
@@ -128,8 +161,57 @@ def _apply_output_extra_info(meta, output):
     return meta
 
 
+def _normalize_batch_meta_size(meta):
+    """Best-effort fix for BatchMeta copies whose reported size drifts from their indexes."""
+    rows = None
+    global_indexes = getattr(meta, "global_indexes", None)
+    if global_indexes is not None:
+        try:
+            rows = len(global_indexes)
+        except Exception:
+            rows = None
+    if rows is None:
+        return meta
+
+    for attr_name in ("size", "_size"):
+        try:
+            current = getattr(meta, attr_name)
+        except Exception:
+            current = None
+        if current != rows:
+            try:
+                setattr(meta, attr_name, rows)
+            except Exception:
+                pass
+    return meta
+
+
+def _is_empty_batch_meta(meta) -> bool:
+    """Return True when BatchMeta is only a dispatch placeholder."""
+    if meta is None:
+        return False
+    meta = _normalize_batch_meta_size(meta)
+    size = getattr(meta, "size", None)
+    if size == 0:
+        return True
+    global_indexes = getattr(meta, "global_indexes", None)
+    try:
+        return global_indexes is not None and len(global_indexes) == 0
+    except Exception:
+        return False
+
+
+def _placeholder_meta_info(meta):
+    """Build minimal meta_info for an empty dispatch placeholder."""
+    meta_info, non_tensor_batch = _split_extra_info(getattr(meta, "extra_info", None))
+    meta_info = copy.deepcopy(meta_info)
+    meta_info["_broadcast_non_tensor_batch"] = True
+    return meta_info
+
+
 async def _async_meta_to_realdata(meta) -> TensorDict:
     tq, _, _ = _ensure_tq_imports()
+    meta = _normalize_batch_meta_size(meta)
     if meta.size == 0:
         return TensorDict({}, batch_size=(0,))
 
@@ -141,10 +223,14 @@ def _meta_to_realdata(meta) -> TensorDict:
     _, _, KVBatchMeta = _ensure_tq_imports()
     if isinstance(meta, KVBatchMeta):
         meta = kv_batch_meta2batch_meta(meta)
+    meta = _normalize_batch_meta_size(meta)
     return _run_async_in_temp_loop(_async_meta_to_realdata, meta)
 
 
 def _meta_to_dataproto(meta) -> DataProto:
+    if _is_empty_batch_meta(meta):
+        meta_info = _placeholder_meta_info(meta)
+        return DataProto(batch=None, non_tensor_batch={}, meta_info=meta_info)
     td = _meta_to_realdata(meta)
     meta_info, non_tensor_batch = _split_extra_info(getattr(meta, "extra_info", None))
     return DataProto(batch=td, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
@@ -154,6 +240,9 @@ async def _async_meta_to_dataproto(meta) -> DataProto:
     _, _, KVBatchMeta = _ensure_tq_imports()
     if isinstance(meta, KVBatchMeta):
         meta = await async_kv_batch_meta2batch_meta(meta)
+    if _is_empty_batch_meta(meta):
+        meta_info = _placeholder_meta_info(meta)
+        return DataProto(batch=None, non_tensor_batch={}, meta_info=meta_info)
     td = await _async_meta_to_realdata(meta)
     meta_info, non_tensor_batch = _split_extra_info(getattr(meta, "extra_info", None))
     return DataProto(batch=td, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
@@ -206,10 +295,15 @@ def _extract_writable_tensordict(output):
     return None
 
 
-def _postprocess_common(output, put_data, need_collect):
+def _empty_batch_meta():
     _, BatchMeta, _ = _ensure_tq_imports()
+    meta = BatchMeta(global_indexes=[], partition_ids=[])
+    return _normalize_batch_meta_size(meta)
+
+
+def _postprocess_common(output, put_data, need_collect):
     if put_data and not need_collect:
-        return BatchMeta()
+        return _empty_batch_meta()
     if not put_data and not need_collect and isinstance(output, DataProto):
         return DataProto()
     if not put_data and not need_collect and isinstance(output, TensorDict):
@@ -291,7 +385,23 @@ def tqbridge(dispatch_mode=None):
             tq, BatchMeta, _ = _ensure_tq_imports()
             batch_meta = _find_batch_meta(*args, **kwargs)
             if batch_meta is None:
-                return func(*args, **kwargs)
+                for arg in args:
+                    if isinstance(arg, DataProto) and arg.batch is not None:
+                        rows = arg.batch.batch_size[0]
+                        data_mb = _calc_dataproto_size_mb(arg)
+                        logger.info(
+                            f"[NO TQ worker] {func.__name__} | INPUT VIA RAY | rows={rows} "
+                            f"| data={data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
+                        )
+                output = func(*args, **kwargs)
+                writable_td = _extract_writable_tensordict(output)
+                if writable_td is not None:
+                    write_data_mb = _calc_tensordict_size_mb(writable_td)
+                    logger.info(
+                        f"[NO TQ worker] {func.__name__} | OUTPUT VIA RAY | rows={writable_td.batch_size[0]} "
+                        f"| data={write_data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
+                    )
+                return output
 
             global TQ_INITIALIZED
             if not TQ_INITIALIZED:
@@ -299,6 +409,7 @@ def tqbridge(dispatch_mode=None):
                 TQ_INITIALIZED = True
 
             io_meta = batch_meta
+            is_placeholder_input = _is_empty_batch_meta(io_meta)
             n_rows = getattr(io_meta, 'size', len(getattr(io_meta, 'global_indexes', [])))
 
             # Worker side: TQ READ
@@ -330,12 +441,18 @@ def tqbridge(dispatch_mode=None):
 
             writable_td = _extract_writable_tensordict(output)
             put_data = writable_td is not None
+            need_collect = _compute_need_collect(dispatch_mode, args)
+            if is_placeholder_input:
+                logger.info(
+                    f"[TQ worker] {func.__name__} | SKIP WRITEBACK | rows={n_rows} "
+                    f"(dispatch_first placeholder rank; output is not collected)"
+                )
+                return _postprocess_common(output, put_data, False)
             if put_data:
                 assert writable_td.batch_size[0] == io_meta.size, (
                     f"output batch_size {writable_td.batch_size} != meta size {io_meta.size}"
                 )
 
-            need_collect = _compute_need_collect(dispatch_mode, args)
             if put_data and need_collect:
                 # Worker side: TQ WRITE
                 write_data_mb = sum(
@@ -362,7 +479,23 @@ def tqbridge(dispatch_mode=None):
             tq, BatchMeta, _ = _ensure_tq_imports()
             batch_meta = _find_batch_meta(*args, **kwargs)
             if batch_meta is None:
-                return await func(*args, **kwargs)
+                for arg in args:
+                    if isinstance(arg, DataProto) and arg.batch is not None:
+                        rows = arg.batch.batch_size[0]
+                        data_mb = _calc_dataproto_size_mb(arg)
+                        logger.info(
+                            f"[NO TQ worker] {func.__name__} | INPUT VIA RAY | rows={rows} "
+                            f"| data={data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
+                        )
+                output = await func(*args, **kwargs)
+                writable_td = _extract_writable_tensordict(output)
+                if writable_td is not None:
+                    write_data_mb = _calc_tensordict_size_mb(writable_td)
+                    logger.info(
+                        f"[NO TQ worker] {func.__name__} | OUTPUT VIA RAY | rows={writable_td.batch_size[0]} "
+                        f"| data={write_data_mb:.2f}MB | rss={_get_process_rss_gb():.3f}GB"
+                    )
+                return output
 
             global TQ_INITIALIZED
             if not TQ_INITIALIZED:
@@ -370,6 +503,7 @@ def tqbridge(dispatch_mode=None):
                 TQ_INITIALIZED = True
 
             io_meta = batch_meta
+            is_placeholder_input = _is_empty_batch_meta(io_meta)
             n_rows = getattr(io_meta, 'size', len(getattr(io_meta, 'global_indexes', [])))
 
             # Worker side: TQ READ (async)
@@ -403,12 +537,18 @@ def tqbridge(dispatch_mode=None):
 
             writable_td = _extract_writable_tensordict(output)
             put_data = writable_td is not None
+            need_collect = _compute_need_collect(dispatch_mode, args)
+            if is_placeholder_input:
+                logger.info(
+                    f"[TQ worker] {func.__name__} | SKIP WRITEBACK | rows={n_rows} "
+                    f"(dispatch_first placeholder rank; output is not collected)"
+                )
+                return _postprocess_common(output, put_data, False)
             if put_data:
                 assert writable_td.batch_size[0] == io_meta.size, (
                     f"output batch_size {writable_td.batch_size} != meta size {io_meta.size}"
                 )
 
-            need_collect = _compute_need_collect(dispatch_mode, args)
             if put_data and need_collect:
                 write_data_mb = sum(
                     v.nbytes for v in writable_td.values() if hasattr(v, 'nbytes')
