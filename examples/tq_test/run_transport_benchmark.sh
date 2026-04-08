@@ -12,6 +12,18 @@ mkdir -p $TORCH_EXTENSIONS_DIR
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 
+# Optional Ray storage overrides.
+# Important: these only take effect when this script starts a fresh Ray cluster.
+ROLL_RAY_OBJECT_STORE_MEMORY_BYTES=${ROLL_RAY_OBJECT_STORE_MEMORY_BYTES:-400000000000}
+ROLL_RAY_TEMP_DIR=${ROLL_RAY_TEMP_DIR:-/tmp/ray_transport_benchmark}
+if [ -n "${ROLL_RAY_OBJECT_STORE_MEMORY_BYTES}" ]; then
+  export ROLL_RAY_OBJECT_STORE_MEMORY_BYTES
+fi
+if [ -n "${ROLL_RAY_TEMP_DIR}" ]; then
+  mkdir -p "${ROLL_RAY_TEMP_DIR}"
+  export ROLL_RAY_TEMP_DIR
+fi
+
 DEVICE_IDS=${DEVICE_IDS:-0,1,2,3}
 NUM_DEVICES_PER_NODE=${NUM_DEVICES_PER_NODE:-4}
 NUM_NODES=${NUM_NODES:-1}

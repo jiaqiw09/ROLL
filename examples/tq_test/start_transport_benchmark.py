@@ -1,6 +1,7 @@
 import argparse
 import os
 from types import SimpleNamespace
+import ray
 
 os.environ["TORCH_EXTENSIONS_DIR"] = "/tmp/torch_extensions"
 os.makedirs("/tmp/torch_extensions", exist_ok=True)
@@ -36,6 +37,10 @@ def _build_tq_config(total_storage_size: int, num_data_storage_units: int) -> di
             },
         }
     }
+
+
+def _bytes_to_gib(num_bytes: float) -> float:
+    return num_bytes / (1024 ** 3)
 
 
 def main():
@@ -134,6 +139,10 @@ def main():
 
     payload = result.batch["benchmark_output_payload"]
     input_summary = result.batch["benchmark_input_mb"]
+    payload_total_bytes = payload.numel() * payload.element_size()
+    payload_per_shard_bytes = payload_total_bytes / max(world_size, 1)
+    available_resources = ray.available_resources()
+    object_store_bytes = float(available_resources.get("object_store_memory", 0.0))
     effective_payload_width = payload_width_from_total_bytes(
         total_bytes=int(args.payload_total_mb * 1024 * 1024),
         batch_size=args.batch_size,
@@ -143,6 +152,9 @@ def main():
     print(f"world_size={world_size}")
     print(f"rows={len(result)}")
     print(f"payload_total_mb={args.payload_total_mb}")
+    print(f"payload_total_gib={_bytes_to_gib(payload_total_bytes):.3f}")
+    print(f"payload_per_shard_gib={_bytes_to_gib(payload_per_shard_bytes):.3f}")
+    print(f"object_store_gib={_bytes_to_gib(object_store_bytes):.3f}")
     print(f"effective_payload_width={effective_payload_width}")
     print(f"output_payload_shape={tuple(payload.shape)}")
     print(f"benchmark_input_mb_shape={tuple(input_summary.shape)}")
