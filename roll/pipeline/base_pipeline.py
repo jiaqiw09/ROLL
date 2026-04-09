@@ -1,3 +1,4 @@
+import dataclasses
 import os
 import re
 import shutil
@@ -43,6 +44,13 @@ class BasePipeline:
         self.resume_from_checkpoint = False
         self.executor: futures.ThreadPoolExecutor = futures.ThreadPoolExecutor(max_workers=5)
         self.resume_futures = []
+
+        tq_conf = getattr(pipeline_config, "transfer_queue", None)
+        if tq_conf is not None and getattr(tq_conf, "enable", False):
+            from roll.utils.transferqueue_utils import init_tq
+
+            init_tq(dataclasses.asdict(tq_conf))
+            logger.info("TransferQueue initialized in BasePipeline")
 
         if self.pipeline_config.resume_from_checkpoint:
             self.resume_from_checkpoint = download_model(self.pipeline_config.resume_from_checkpoint)

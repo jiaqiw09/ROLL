@@ -14,6 +14,44 @@ from roll.utils.logging import get_logger
 logger = get_logger()
 
 @dataclass
+class TransferQueueStorageConfig:
+    """Backend configuration for TransferQueue storage."""
+    storage_backend: str = field(
+        default="SimpleStorage",
+        metadata={"help": "Storage backend type for TransferQueue."}
+    )
+    SimpleStorage: Dict = field(
+        default_factory=lambda: {"total_storage_size": 100000, "num_data_storage_units": 8},
+        metadata={"help": "SimpleStorage configuration."}
+    )
+
+
+@dataclass
+class TransferQueueConfig:
+    """Configuration for TransferQueue integration."""
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable TransferQueue for data transfer."}
+    )
+    backend: TransferQueueStorageConfig = field(
+        default_factory=TransferQueueStorageConfig,
+        metadata={"help": "TransferQueue backend configuration."}
+    )
+    log_enable: bool = field(
+        default=True,
+        metadata={"help": "Whether to emit TransferQueue transport and conversion logs."}
+    )
+    log_level: str = field(
+        default="INFO",
+        metadata={"help": "Logging level for TransferQueue trace logs."}
+    )
+    log_scenes: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Optional allow-list of TransferQueue trace scenes. Null means log all scenes."}
+    )
+
+
+@dataclass
 class RolloutMockConfig:
     """Configuration for rollout dump/mock mechanism for precision alignment testing."""
     enable: bool = field(
@@ -242,6 +280,10 @@ class BaseConfig(ScheduleConfig):
     rollout_mock: Optional[RolloutMockConfig] = field(
         default=None,
         metadata={"help": "Rollout mock configuration for precision alignment testing."}
+    )
+    transfer_queue: TransferQueueConfig = field(
+        default_factory=TransferQueueConfig,
+        metadata={"help": "TransferQueue configuration for async data transfer and trace logging."}
     )
 
 

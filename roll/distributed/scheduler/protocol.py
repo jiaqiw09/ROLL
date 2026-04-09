@@ -668,28 +668,44 @@ class DataProto:
             A new DataProto with concatenated tensors, non-tensor data,
             and processed meta information.
         """
-        global_keys = global_keys if global_keys is not None else {"metrics"}
-
-        # ---------- 1. Concatenate tensor / non-tensor batches ----------
-        batch_lst = [d.batch for d in data if d.batch is not None]
-        new_batch = torch.cat(batch_lst, dim=0) if batch_lst else None
-
-        non_tensor_batch = list_of_dict_to_dict_of_list(
-            [d.non_tensor_batch for d in data]
+        return DataProto(
+            batch=DataProto._concat_tensor_batches(data),
+            non_tensor_batch=DataProto._concat_non_tensor_batches(data),
+            meta_info=DataProto._merge_meta_info(data, global_keys=global_keys),
         )
-        for k, v in non_tensor_batch.items():
-            non_tensor_batch[k] = custom_np_concatenate(v)
 
-        # ---------- 2. Aggregate meta information ----------
-        merged_meta = dict(data[0].meta_info)  # start with rank-0 values
+    @staticmethod
+    def _concat_tensor_batches(data: List["DataProto"]) -> Optional[TensorDict]:
+        if not data:
+            raise ValueError("DataProto.concat requires at least one DataProto")
+        batch_lst = [d.batch for d in data if d.batch is not None]
+        return torch.cat(batch_lst, dim=0) if batch_lst else None
+
+    @staticmethod
+    def _concat_non_tensor_batches(data: List["DataProto"]) -> Dict:
+        if not data:
+            raise ValueError("DataProto.concat requires at least one DataProto")
+        non_tensor_batch = list_of_dict_to_dict_of_list([d.non_tensor_batch for d in data])
+        for key, values in non_tensor_batch.items():
+            non_tensor_batch[key] = custom_np_concatenate(values)
+        return non_tensor_batch
+
+    @staticmethod
+    def _merge_meta_info(
+        data: List["DataProto"],
+        *,
+        global_keys: Optional[Set[str]] = None,
+    ) -> Dict:
+        if not data:
+            raise ValueError("DataProto.concat requires at least one DataProto")
+        global_keys = global_keys if global_keys is not None else {"metrics"}
+        merged_meta = dict(data[0].meta_info)
 
         for key in global_keys:
             if key not in merged_meta:
                 continue
 
             values = [d.meta_info.get(key) for d in data]
-
-            # Case 1: dict — aggregate each sub-key across ranks
             if isinstance(merged_meta[key], dict):
                 sub_dict = list_of_dict_to_dict_of_list(values)
                 for sub_key, sub_list in sub_dict.items():
@@ -699,19 +715,12 @@ class DataProto:
                         else:
                             sub_dict[sub_key] = np.concatenate(sub_list, axis=0).tolist()
                     except Exception:
-                        # fallback: keep as list
                         sub_dict[sub_key] = sub_list
                 merged_meta[key] = sub_dict
-
-            # Case 2: non-dict — collect into list
             else:
                 merged_meta[key] = values
 
-        return DataProto(
-            batch=new_batch,
-            non_tensor_batch=non_tensor_batch,
-            meta_info=merged_meta,
-        )
+        return merged_meta
 
     def reorder(self, indices):
         """
@@ -836,9 +845,10 @@ class DataProto:
         DataProto
             The concatenated DataProto instance.
         """
-        # Normalize input to List[<reference>]
         if isinstance(data_refs, DataProto):
-            data_refs = [data_refs]
+            return data_refs
+        if isinstance(data_refs, list) and data_refs and isinstance(data_refs[0], DataProto):
+            return DataProto.concat(data_refs, global_keys=global_keys)
 
         timeout = None
         if "roll_RPC_TIMEOUT" in os.environ:

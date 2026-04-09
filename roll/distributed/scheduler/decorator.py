@@ -13,14 +13,30 @@ from more_itertools import chunked
 import ray
 import torch
 import asyncio
+import copy
+import time
+import uuid
 
 from roll.distributed.scheduler.protocol import DataProto, ObjectRefWrap
+from roll.utils.transferqueue_trace import (
+    NO_TQ_COLLECT_TRACE_KEY,
+    NO_TQ_DISPATCH_TRACE_KEY,
+    TQ_COLLECT_TRACE_KEY,
+    TQ_DISPATCH_TRACE_KEY,
+    _attach_trace,
+    _calc_dataproto_size_mb,
+    _calc_tensordict_size_mb,
+    _log_no_tq_collect_e2e,
+    _log_tq_collect_e2e,
+    _make_dispatch_trace,
+)
 from roll.utils.logging import get_logger
 from roll.platforms import current_platform
 
 logger = get_logger()
 
 BIND_WORKER_METHOD_FLAG = "BIND_WORKER_METHOD_FLAG"
+TQ_DISPATCH_PARTITION_ID = "train_dispatch"
 
 
 class Dispatch(Enum):
@@ -106,10 +122,143 @@ def dispatch_all_to_all(cluster, *args, **kwargs):
     return args, kwargs
 
 
+def _is_tq_enabled(cluster) -> bool:
+    from roll.utils.transferqueue_utils import is_tq_runtime_enabled
+
+    return is_tq_runtime_enabled()
+
+
+def _is_representative_rank(rank_info) -> bool:
+    return (
+        getattr(rank_info, "tp_rank", 0) == 0
+        and getattr(rank_info, "is_pipeline_last_stage", True)
+        and getattr(rank_info, "cp_rank", 0) == 0
+    )
+
+
+def _collect_representative_results(cluster, raw_output):
+    rep_results = []
+    for global_rank in range(cluster.world_size):
+        local_rank_info = cluster.get_rank_info(rank=global_rank)
+        if _is_representative_rank(local_rank_info):
+            rep_results.append(raw_output[global_rank])
+    return rep_results
+
+
 def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
     """
     将输入chunk成dp_world_size份，按dp_rank为每个worker组织数据 -> 同一dp_rank收到的数据都是相同的
     """
+    use_tq = _is_tq_enabled(cluster)
+
+    if use_tq:
+        from roll.utils.transferqueue_utils import (
+            _pack_extra_info,
+            _put_dataproto_to_batchmeta,
+            _set_batchmeta_row_count,
+        )
+
+        def _dataproto_to_batchmeta_shards(data: DataProto, dp_size: int):
+            td = data.batch
+            data_mb = _calc_tensordict_size_mb(td)
+            n_rows = td.batch_size[0] if td is not None and td.batch_size else 0
+            dispatch_started_at = time.time()
+            full_trace = _make_dispatch_trace(
+                rows=n_rows,
+                data_mb=data_mb,
+                dp_size=dp_size,
+                partition_id=TQ_DISPATCH_PARTITION_ID,
+                driver_put_started_at=dispatch_started_at,
+            )
+            full_meta = _put_dataproto_to_batchmeta(
+                data,
+                partition_id=TQ_DISPATCH_PARTITION_ID,
+                scene="dispatch_driver_put",
+                trace_key=TQ_DISPATCH_TRACE_KEY,
+                trace_payload=full_trace,
+            )
+            full_trace["driver_put_cost"] = time.time() - dispatch_started_at
+            full_meta.extra_info = _pack_extra_info(
+                _attach_trace(data.meta_info, TQ_DISPATCH_TRACE_KEY, full_trace),
+                data.non_tensor_batch,
+            )
+
+            dp_shards = data.chunk(chunks=dp_size)
+            all_idx = list(full_meta.global_indexes)
+            all_partition_ids = list(full_meta.partition_ids)
+            shards = []
+            start = 0
+
+            for shard_data in dp_shards:
+                shard_rows = len(shard_data)
+                end = start + shard_rows
+                shard_idx = all_idx[start:end]
+                if shard_rows == 0:
+                    shard_partition_ids = []
+                elif len(all_partition_ids) == 1:
+                    shard_partition_ids = all_partition_ids * shard_rows
+                else:
+                    shard_partition_ids = all_partition_ids[start:end]
+                shard_meta = copy.deepcopy(full_meta)
+                shard_meta.global_indexes = shard_idx
+                shard_meta.partition_ids = shard_partition_ids
+                _set_batchmeta_row_count(shard_meta, shard_rows)
+                shard_trace = _make_dispatch_trace(
+                    rows=shard_rows,
+                    data_mb=_calc_dataproto_size_mb(shard_data),
+                    dp_size=dp_size,
+                    partition_id=TQ_DISPATCH_PARTITION_ID,
+                    trace_id=full_trace["trace_id"],
+                    driver_put_started_at=full_trace["driver_put_started_at"],
+                    driver_put_cost=full_trace["driver_put_cost"],
+                )
+                shard_meta.extra_info = _pack_extra_info(
+                    _attach_trace(shard_data.meta_info, TQ_DISPATCH_TRACE_KEY, shard_trace),
+                    shard_data.non_tensor_batch,
+                )
+                shards.append(shard_meta)
+                start = end
+            return shards
+
+        new_args = []
+        for arg in args:
+            if isinstance(arg, DataProto):
+                new_args.append(_dataproto_to_batchmeta_shards(arg, cluster.dp_size))
+            else:
+                new_args.append(arg.chunk(chunks=cluster.dp_size) if hasattr(arg, "chunk") else [arg] * cluster.dp_size)
+        new_kwargs = {}
+        for key, value in kwargs.items():
+            if isinstance(value, DataProto):
+                new_kwargs[key] = _dataproto_to_batchmeta_shards(value, cluster.dp_size)
+            else:
+                new_kwargs[key] = value.chunk(chunks=cluster.dp_size) if hasattr(value, "chunk") else [value] * cluster.dp_size
+
+        def _get_tq_arg(arg_list, rank_info):
+            shard = arg_list[rank_info.dp_rank]
+            if _dispatch_first and not (
+                getattr(rank_info, "tp_rank", 0) == 0
+                and getattr(rank_info, "cp_rank", 0) == 0
+                and getattr(rank_info, "pp_rank", 0) == 0
+            ):
+                empty = copy.deepcopy(shard)
+                empty.global_indexes = []
+                empty.partition_ids = []
+                _set_batchmeta_row_count(empty, 0)
+                return empty
+            return shard
+
+        all_args = tuple(
+            [_get_tq_arg(arg_list, cluster.get_rank_info(rank=i)) for i in range(cluster.world_size)]
+            for arg_list in new_args
+        )
+        all_kwargs = {
+            key: [_get_tq_arg(value_list, cluster.get_rank_info(rank=i)) for i in range(cluster.world_size)]
+            for key, value_list in new_kwargs.items()
+        }
+        return all_args, all_kwargs
+
+    from roll.utils.transferqueue_utils import NO_TQ_DISPATCH_TRACE_KEY, _attach_trace
+
     splitted_args, splitted_kwargs = _split_args_kwargs(cluster.dp_size, *args, **kwargs)
     all_args = []
 
@@ -124,6 +273,24 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
         return arg[local_dp_rank]
 
     for arg in splitted_args:
+        if isinstance(arg, (Tuple, List)) and arg and isinstance(arg[0], DataProto):
+            trace_id = uuid.uuid4().hex[:12]
+            dispatch_started_at = time.time()
+            traced = []
+            for shard in arg:
+                shard.meta_info = _attach_trace(
+                    shard.meta_info,
+                    NO_TQ_DISPATCH_TRACE_KEY,
+                    {
+                        "trace_id": trace_id,
+                        "dispatch_started_at": dispatch_started_at,
+                        "rows": len(shard),
+                        "data_mb": _calc_dataproto_size_mb(shard),
+                        "dp_size": cluster.dp_size,
+                    },
+                )
+                traced.append(shard)
+            arg = traced
         assert isinstance(arg, (Tuple, List)) and len(arg) == cluster.dp_size
         transformed_args = []
         for i in range(cluster.world_size):
@@ -134,6 +301,24 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
 
     all_kwargs = {}
     for k, v in splitted_kwargs.items():
+        if isinstance(v, (Tuple, List)) and v and isinstance(v[0], DataProto):
+            trace_id = uuid.uuid4().hex[:12]
+            dispatch_started_at = time.time()
+            traced = []
+            for shard in v:
+                shard.meta_info = _attach_trace(
+                    shard.meta_info,
+                    NO_TQ_DISPATCH_TRACE_KEY,
+                    {
+                        "trace_id": trace_id,
+                        "dispatch_started_at": dispatch_started_at,
+                        "rows": len(shard),
+                        "data_mb": _calc_dataproto_size_mb(shard),
+                        "dp_size": cluster.dp_size,
+                    },
+                )
+                traced.append(shard)
+            v = traced
         assert isinstance(v, (Tuple, List)) and len(v) == cluster.dp_size
         transformed_v = []
         for i in range(cluster.world_size):
@@ -156,31 +341,81 @@ def collect_dp_mp_compute(cluster, output):
     只需要搜集tp=0, pipeline_last_stage的结果
     输入输出都是list, 是batch维度的
     """
-    output_in_dp = []
-    for global_rank in range(cluster.world_size):
-        local_rank_info = cluster.get_rank_info(rank=global_rank)
-        if local_rank_info.tp_rank == 0 and local_rank_info.is_pipeline_last_stage and local_rank_info.cp_rank == 0:
-            output_in_dp.append(output[global_rank])
-    if isinstance(output[0], list):
-        return list(chain.from_iterable(output_in_dp))
-    elif isinstance(output[0], DataProto):
-        return DataProto.concat(output_in_dp)
-    elif isinstance(output[0], ray.ObjectRef):
-        # 处理block=False情况下，dp内的可能完成时间不一致问题
+    use_tq = _is_tq_enabled(cluster)
+    is_refs = isinstance(output[0], ray.ObjectRef) if output else False
+    ray_get_cost = 0.0
+    raw_output = output
+
+    if use_tq and is_refs:
+        timeout = int(os.environ.get("roll_RPC_TIMEOUT", 3600)) if "roll_RPC_TIMEOUT" in os.environ else None
+        t0 = time.time()
+        raw_output = ray.get(list(output), timeout=timeout)
+        ray_get_cost = time.time() - t0
+
+    rep_results = _collect_representative_results(cluster, raw_output)
+
+    if use_tq:
+        from roll.utils.transferqueue_utils import (
+            _meta_to_dataproto,
+            _split_extra_info,
+            is_batch_meta,
+            merge_batch_metas,
+        )
+
+        if rep_results and is_batch_meta(rep_results[0]):
+            collect_traces = []
+            for meta in rep_results:
+                meta_info, _ = _split_extra_info(getattr(meta, "extra_info", None))
+                trace = meta_info.get(TQ_COLLECT_TRACE_KEY)
+                if isinstance(trace, dict):
+                    collect_traces.append(trace)
+
+            merged_meta = merge_batch_metas(rep_results)
+            total_rows = len(getattr(merged_meta, "global_indexes", []))
+            t0 = time.time()
+            result = _meta_to_dataproto(
+                merged_meta,
+                scene="collect_driver_read",
+                trace_key=TQ_COLLECT_TRACE_KEY,
+                meta_count=len(rep_results),
+            )
+            tq_cost = max(0.0, time.time() - t0)
+            result_mb = _calc_dataproto_size_mb(result)
+            _log_tq_collect_e2e(
+                collect_traces,
+                total_rows=total_rows,
+                data_mb=result_mb,
+                driver_read_cost=tq_cost,
+            )
+            return result
+
+    if is_refs:
         output_in_dp = []
         for global_rank in range(cluster.world_size):
             local_rank_info = cluster.get_rank_info(rank=global_rank)
-            collected = False
-            if (
-                local_rank_info.tp_rank == 0
-                and local_rank_info.is_pipeline_last_stage
-                and local_rank_info.cp_rank == 0
-            ):
-                collected = True
-            output_in_dp.append(ObjectRefWrap(output[global_rank], collected=collected))
+            output_in_dp.append(ObjectRefWrap(output[global_rank], collected=_is_representative_rank(local_rank_info)))
         return output_in_dp
-    else:
-        raise NotImplementedError(f"output type {type(output[0])}")
+
+    if isinstance(rep_results[0], list):
+        return list(chain.from_iterable(rep_results))
+    if isinstance(rep_results[0], DataProto):
+        from roll.utils.transferqueue_utils import _pop_trace
+
+        result_mb = sum(_calc_dataproto_size_mb(result) for result in rep_results)
+        total_rows = sum(result.batch.batch_size[0] for result in rep_results if result.batch is not None)
+        collect_traces = []
+        for result in rep_results:
+            trace = _pop_trace(result.meta_info, NO_TQ_COLLECT_TRACE_KEY)
+            if isinstance(trace, dict):
+                collect_traces.append(trace)
+        _log_no_tq_collect_e2e(
+            collect_traces,
+            total_rows=total_rows,
+            data_mb=result_mb,
+            ray_get_cost=ray_get_cost,
+        )
+        return DataProto.concat(rep_results)
+    raise NotImplementedError(f"output type {type(rep_results[0])}")
 
 
 predefined_dispatch_mode_fn = {
@@ -268,11 +503,22 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, clear_
     def decorator(func):
         is_async = asyncio.iscoroutinefunction(func)
         attrs = {"dispatch_mode": dispatch_mode, "execute_mode": execute_mode}
+        bridge_dispatch_modes = {
+            Dispatch.DP_MP_COMPUTE,
+            Dispatch.DP_MP_DISPATCH_FIRST,
+            Dispatch.DP_MP_DISPATCH_FIRST_COLLECT_ALL,
+        }
+        if isinstance(dispatch_mode, dict) or dispatch_mode in bridge_dispatch_modes:
+            from roll.utils.transferqueue_utils import tqbridge
+
+            wrapped_func = tqbridge(dispatch_mode)(func)
+        else:
+            wrapped_func = func
         if is_async:
             @wraps(func)
             async def inner_async(*args, **kwargs):
                 try:
-                    result = await func(*args, **kwargs)
+                    result = await wrapped_func(*args, **kwargs)
                     if clear_cache:
                         try:
                             current_platform.clear_cublas_workspaces()
@@ -293,7 +539,7 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, clear_
             @wraps(func)
             def inner(*args, **kwargs):
                 try:
-                    result = func(*args, **kwargs)
+                    result = wrapped_func(*args, **kwargs)
                     if clear_cache:
                         try:
                             current_platform.clear_cublas_workspaces()

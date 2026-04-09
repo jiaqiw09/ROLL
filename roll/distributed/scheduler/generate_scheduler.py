@@ -3,6 +3,7 @@ import copy
 import itertools
 import random
 import math
+import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
@@ -26,9 +27,28 @@ from roll.utils.taskgroups import TaskGroup # TODO use official TaskGroup after 
 from roll.utils.metrics.metrics_manager import DurationTracker
 from roll.utils.import_utils import safe_import_class
 from roll.utils.logging import get_logger
+from roll.utils.transferqueue_trace import _log_tq_replay_write
 
 
 logger = get_logger()
+TQ_SCHEDULER_RETURN_PARTITION_ID = "train_scheduler_return"
+TQ_REPLAY_PARTITION_ID = "train_replay"
+
+
+def _calc_tensordict_size_mb(td) -> float:
+    total = 0
+    if td is None:
+        return 0.0
+    for value in td.values():
+        if hasattr(value, "nbytes"):
+            total += value.nbytes
+    return total / (1024 * 1024)
+
+
+def _calc_dataproto_size_mb(data: Optional[DataProto]) -> float:
+    if data is None:
+        return 0.0
+    return _calc_tensordict_size_mb(data.batch)
 
 
 def expand_requests(data: DataProto, num_return_sequences, is_num_return_sequences_expand):
@@ -73,7 +93,7 @@ class ExperienceItem:
     prompt_id: int
     domain: str = "default"
     sampling_start_step: Optional[int] = None
-    data: Optional[DataProto] = None
+    data: Optional[Any] = None
 
 
 class ItemsGroup:
@@ -514,6 +534,11 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         self.reward_scheduler = RewardScheduler()
 
     async def initialize(self):
+        if self._is_tq_enabled_for_scheduler():
+            from roll.utils.transferqueue_utils import init_tq
+
+            init_tq(getattr(self.pipeline_config, "transfer_queue", None))
+            logger.info("TransferQueue initialized in DynamicSamplingScheduler")
         await self.router_manager.initialize()
         self.router_client = await RouterManager.create_client(self.router_manager)
 
@@ -602,7 +627,12 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         }
         return batch
 
-    async def get_batch(self, data: DataProto, global_step: int, batch_size: int) -> DataProto:
+    async def get_batch(
+        self,
+        data: DataProto,
+        global_step: int,
+        batch_size: int,
+    ) -> Any:
         # MOCK MODE: Load pre-recorded data, skip rollout (from mixin)
         if self._should_load_mock(global_step):
             return await self._load_mock_batch(global_step)
@@ -645,6 +675,7 @@ class DynamicSamplingScheduler(RolloutMockMixin):
             assert len(finished_items) >= batch_size * num_return_sequences
             finished_items = finished_items[:batch_size * num_return_sequences]
         assert len(finished_items) == batch_size * num_return_sequences
+        use_tq = self._is_tq_enabled_for_scheduler()
         batch = self.collect_items_as_batch(finished_items=finished_items)
 
         if self.is_val or self.pipeline_config.async_generation_ratio <= 0:
@@ -663,19 +694,99 @@ class DynamicSamplingScheduler(RolloutMockMixin):
             metrics[f"scheduler/{domain}/time/reward/min"] = reward_stat["min"]
             metrics[f"scheduler/{domain}/time/reward/max"] = reward_stat["max"]
             metrics[f"scheduler/{domain}/time/reward/mean"] = reward_stat["mean"]
-            batch.meta_info["metrics"].update(metrics)
+            self._update_batch_payload_metrics(batch, metrics)
 
         # DUMP MODE: Save merged batch (from mixin)
-        await self._maybe_dump_batch(batch, global_step)
+        if isinstance(batch, DataProto):
+            await self._maybe_dump_batch(batch, global_step)
+        elif self._should_dump_batch():
+            await self._maybe_dump_batch(self._materialize_batch_payload(batch), global_step)
+
+        if use_tq and self._is_batch_meta_payload(batch):
+            return batch
+
+        if use_tq:
+            materialized_batch = self._materialize_batch_payload(batch)
+            from roll.utils.transferqueue_utils import _async_put_dataproto_to_batchmeta
+
+            batch_meta = await _async_put_dataproto_to_batchmeta(
+                materialized_batch,
+                partition_id=TQ_SCHEDULER_RETURN_PARTITION_ID,
+                scene="scheduler_return_write",
+            )
+            return batch_meta
 
         return batch
 
-    def collect_items_as_batch(self, finished_items: List[ExperienceItem]) -> DataProto:
+    def _is_tq_enabled_for_scheduler(self) -> bool:
+        tq_conf = getattr(self.pipeline_config, "transfer_queue", None)
+        return tq_conf is not None and getattr(tq_conf, "enable", False)
+
+    def _is_batch_meta_payload(self, payload: Any) -> bool:
+        if not self._is_tq_enabled_for_scheduler():
+            return False
+        from roll.utils.transferqueue_utils import is_batch_meta
+
+        return is_batch_meta(payload)
+
+    def _materialize_batch_payload(self, payload: Any) -> DataProto:
+        if isinstance(payload, DataProto):
+            return payload
+        from roll.utils.transferqueue_utils import meta_to_dataproto
+
+        return meta_to_dataproto(payload)
+
+    def _update_batch_payload_metrics(self, payload: Any, metrics: Dict[str, float]) -> None:
+        if isinstance(payload, DataProto):
+            payload.meta_info.setdefault("metrics", {}).update(metrics)
+            return
+
+        from roll.utils.transferqueue_utils import _pack_extra_info, _split_extra_info
+
+        meta_info, non_tensor_batch = _split_extra_info(getattr(payload, "extra_info", None))
+        meta_info.setdefault("metrics", {}).update(metrics)
+        payload.extra_info = _pack_extra_info(meta_info, non_tensor_batch)
+
+    def _build_collect_batch_metrics(
+        self,
+        collect_data_by_domain: Dict[str, DataProto],
+        *,
+        query_use_count: int,
+        data_off_policy_step: float,
+        expected_items: int,
+    ) -> Dict[str, float]:
+        collect_data_num = sum(len(data) for data in collect_data_by_domain.values())
+        assert collect_data_num == expected_items
+        logger.info(f"total collect data: {collect_data_num}, collect queries: {query_use_count}")
+
+        metrics = {
+            "scheduler/collect_query_count": query_use_count,
+            "scheduler/query_use_count": query_use_count,
+            "scheduler/off_policy_ratio": data_off_policy_step,
+        }
+        for domain, response_batch in collect_data_by_domain.items():
+            sequence_score = response_batch.batch["scores"]
+            metrics[f"scheduler/{domain}/score/mean"] = torch.mean(sequence_score).detach().item()
+            metrics[f"scheduler/{domain}/score/max"] = torch.max(sequence_score).detach().item()
+            metrics[f"scheduler/{domain}/score/min"] = torch.min(sequence_score).detach().item()
+        return metrics
+
+    def collect_items_as_batch(
+        self,
+        finished_items: List[ExperienceItem],
+    ) -> Any:
+        if self._is_tq_enabled_for_scheduler() and finished_items and all(
+            self._is_batch_meta_payload(item.data) for item in finished_items
+        ):
+            return self._collect_items_as_batch_batchmeta(finished_items=finished_items)
+        return self._collect_items_as_batch_dataproto(finished_items=finished_items)
+
+    def _collect_items_as_batch_dataproto(self, finished_items: List[ExperienceItem]) -> DataProto:
         collect_data_by_domain = defaultdict(list)
         data_off_policy_step = 0.0
         prompt_ids = set()
         for item in finished_items:
-            collect_data_by_domain[item.domain].append(item.data)
+            collect_data_by_domain[item.domain].append(self._materialize_batch_payload(item.data))
             data_off_policy_step += self.replay_buffer.current_step - item.sampling_start_step
             prompt_ids.add(item.prompt_id)
         data_off_policy_step = data_off_policy_step / len(finished_items)
@@ -683,30 +794,62 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         collect_data_by_domain = {
             domain: DataProto.concat(data_list) for domain, data_list in collect_data_by_domain.items()
         }
-        query_use_count = len(prompt_ids)
-        collect_data_num = sum(data.batch.batch_size[0] for data in collect_data_by_domain.values())
-        assert collect_data_num == len(finished_items)
-        logger.info(f"total collect data: {collect_data_num}, collect queries: {query_use_count}")
-
         batch = DataProto.concat(list(collect_data_by_domain.values()))
-        # TODO support response_filter_count and query_filter_count
-        batch.meta_info.setdefault("metrics", {}).update({
-            f"scheduler/collect_query_count": query_use_count,
-            f"scheduler/query_use_count": query_use_count,
-            f"scheduler/off_policy_ratio": data_off_policy_step,
-        })
-
-        metrics = {}
-        for domain, response_batch in collect_data_by_domain.items():
-            sequence_score = response_batch.batch["scores"]
-            metrics[f"scheduler/{domain}/score/mean"] = torch.mean(sequence_score).detach().item()
-            metrics[f"scheduler/{domain}/score/max"] = torch.max(sequence_score).detach().item()
-            metrics[f"scheduler/{domain}/score/min"] = torch.min(sequence_score).detach().item()
-        batch.meta_info["metrics"].update(metrics)
+        batch.meta_info.setdefault("metrics", {}).update(
+            self._build_collect_batch_metrics(
+                collect_data_by_domain,
+                query_use_count=len(prompt_ids),
+                data_off_policy_step=data_off_policy_step,
+                expected_items=len(finished_items),
+            )
+        )
 
         # TODO shigao implement REPORT_LENGTH_AND_REWARDS (deleted at refactor)
-
         return batch
+
+    def _collect_items_as_batch_batchmeta(
+        self,
+        finished_items: List[ExperienceItem],
+    ) -> Any:
+        from roll.utils.transferqueue_utils import (
+            _pack_extra_info,
+            _split_extra_info,
+            merge_batch_metas,
+            meta_to_dataproto,
+        )
+
+        metas_by_domain = defaultdict(list)
+        data_off_policy_step = 0.0
+        prompt_ids = set()
+        for item in finished_items:
+            metas_by_domain[item.domain].append(item.data)
+            data_off_policy_step += self.replay_buffer.current_step - item.sampling_start_step
+            prompt_ids.add(item.prompt_id)
+        data_off_policy_step = data_off_policy_step / len(finished_items)
+
+        merged_metas_by_domain = {
+            domain: merge_batch_metas(meta_list)
+            for domain, meta_list in metas_by_domain.items()
+        }
+        collect_data_by_domain = {
+            domain: meta_to_dataproto(
+                domain_meta,
+                scene="scheduler_collect_materialize",
+                domain=domain,
+            )
+            for domain, domain_meta in merged_metas_by_domain.items()
+        }
+        collect_metrics = self._build_collect_batch_metrics(
+            collect_data_by_domain,
+            query_use_count=len(prompt_ids),
+            data_off_policy_step=data_off_policy_step,
+            expected_items=len(finished_items),
+        )
+        batch_meta = merge_batch_metas(list(merged_metas_by_domain.values()))
+        meta_info, non_tensor_batch = _split_extra_info(getattr(batch_meta, "extra_info", None))
+        meta_info.setdefault("metrics", {}).update(collect_metrics)
+        batch_meta.extra_info = _pack_extra_info(meta_info, non_tensor_batch)
+        return batch_meta
 
     async def sending_request(self):
         async with TaskGroup() as tg:
@@ -783,6 +926,45 @@ class RolloutContext:
                 scheduler.replay_buffer.abort(prompt_id)
             else:
                 assert context.sampling_start_step is not None
+                if scheduler._is_tq_enabled_for_scheduler():
+                    from roll.utils.transferqueue_utils import _async_put_dataproto_to_batchmeta, _run_async_in_temp_loop
+
+                    def _store_response_in_tq(response: DataProto):
+                        async def _put(resp):
+                            if resp.batch is None or len(resp.batch.batch_size) == 0 or resp.batch.batch_size[0] == 0:
+                                return None, 0.0
+                            t0 = time.time()
+                            meta = await _async_put_dataproto_to_batchmeta(
+                                resp,
+                                partition_id=TQ_REPLAY_PARTITION_ID,
+                                scene="replay_write",
+                                prompt_id=prompt_id,
+                                domain=context.domain,
+                            )
+                            return meta, time.time() - t0
+
+                        return _run_async_in_temp_loop(_put, response)
+
+                    total_data_mb = sum(_calc_dataproto_size_mb(response) for response in responses)
+                    total_rows = sum(
+                        response.batch.batch_size[0]
+                        for response in responses
+                        if response.batch is not None
+                    )
+                    committed_responses = []
+                    total_write_cost = 0.0
+                    for response in responses:
+                        batch_meta, write_cost = _store_response_in_tq(response)
+                        total_write_cost += write_cost
+                        committed_responses.append(batch_meta if batch_meta is not None else response)
+                    responses = committed_responses
+                    _log_tq_replay_write(
+                        prompt_id=prompt_id,
+                        response_count=len(responses),
+                        total_rows=total_rows,
+                        data_mb=total_data_mb,
+                        total_write_cost=total_write_cost,
+                    )
                 scheduler.replay_buffer.commit(
                     prompt_id,
                     [

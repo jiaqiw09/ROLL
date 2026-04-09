@@ -499,12 +499,26 @@ class RLVRVLMPipeline(BasePipeline):
                 ) as step_generate_timer:
                     domain_batches = {}
                     scheduler_refs = {}
+                    use_tq = (
+                        getattr(self.pipeline_config, "transfer_queue", None) is not None
+                        and getattr(self.pipeline_config.transfer_queue, "enable", False)
+                    )
                     for domain, scheduler in self.generate_schedulers.items():
                         scheduler_refs[domain] = scheduler.get_batch.remote(
-                            data=batch, global_step=global_step, batch_size=self.domain_batch_size[domain]
+                            data=batch,
+                            global_step=global_step,
+                            batch_size=self.domain_batch_size[domain],
                         )
                     for domain, scheduler_ref in scheduler_refs.items():
-                        domain_batch: DataProto = ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout)
+                        domain_batch = ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout)
+                        if use_tq:
+                            from roll.utils.transferqueue_utils import meta_to_dataproto
+
+                            domain_batch = meta_to_dataproto(
+                                domain_batch,
+                                scene="pipeline_read",
+                                domain=domain,
+                            )
                         metrics_mgr.add_domain_metrics(
                             domain, reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         )
@@ -722,10 +736,18 @@ class RLVRVLMPipeline(BasePipeline):
             batch.meta_info.update(
                 {"global_step": self.global_step, "max_steps": self.pipeline_config.max_steps, "is_training": False}
             )
-            generate_output: DataProto = ray.get(
+            use_tq = (
+                getattr(self.pipeline_config, "transfer_queue", None) is not None
+                and getattr(self.pipeline_config.transfer_queue, "enable", False)
+            )
+            generate_output = ray.get(
                 self.val_generate_scheduler.get_batch.remote(data=batch, global_step=global_step, batch_size=len(self.val_dataset)),
                 timeout=self.pipeline_config.rpc_timeout,
             )
+            if use_tq:
+                from roll.utils.transferqueue_utils import meta_to_dataproto
+
+                generate_output = meta_to_dataproto(generate_output, scene="pipeline_read", domain="validation")
             generate_output.meta_info.pop("is_offload_states", None)
             val_metrics_mgr.add_metric("time/step_generate", step_generate_timer.last)
 
