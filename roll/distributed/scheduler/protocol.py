@@ -250,14 +250,18 @@ class DataProto:
             assert len(self.batch.batch_size) == 1, "only support num_batch_dims=1"
 
         if len(self.non_tensor_batch) != 0:
-            # TODO: we can actually lift this restriction if needed
-            assert len(self.batch.batch_size) == 1, "only support num_batch_dims=1 when non_tensor_batch is not empty."
-
-            batch_size = self.batch.batch_size[0]
+            if self.batch is not None:
+                # TODO: we can actually lift this restriction if needed
+                assert len(self.batch.batch_size) == 1, "only support num_batch_dims=1 when non_tensor_batch is not empty."
+                batch_size = self.batch.batch_size[0]
+            else:
+                batch_size = None
             for key, val in self.non_tensor_batch.items():
                 assert (
                     isinstance(val, np.ndarray) and val.dtype == object
                 ), "data in the non_tensor_batch must be a numpy.array with dtype=object"
+                if batch_size is None:
+                    batch_size = val.shape[0]
                 assert (
                     val.shape[0] == batch_size
                 ), f"key {key} length {len(val)} is not equal to batch size {batch_size}"

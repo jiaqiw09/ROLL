@@ -399,6 +399,7 @@ async def _async_update_batchmeta_from_dataproto(
     data_mb = _calc_tensordict_size_mb(writable_td)
     t0 = time.time()
     tq_client = tq.get_client()
+    partition_id = getattr(meta, "partition_ids", [None])[0] if getattr(meta, "partition_ids", None) else None
 
     trace_payload = None
     output_meta_info = copy.deepcopy(output.meta_info)
@@ -407,20 +408,23 @@ async def _async_update_batchmeta_from_dataproto(
             rows=rows,
             data_mb=data_mb,
             worker_name=worker_name,
-            partition_id=getattr(meta, "partition_ids", [None])[0] if getattr(meta, "partition_ids", None) else None,
+            partition_id=partition_id,
             worker_write_started_at=t0,
         )
         output_meta_info = _attach_trace(output_meta_info, trace_key, trace_payload)
 
-    io_meta = copy.deepcopy(meta)
-    io_meta.extra_info = _pack_extra_info(output_meta_info, output.non_tensor_batch)
-    updated_meta = await tq_client.async_put(data=writable_td.select(*fields), metadata=io_meta)
+    updated_meta = await tq_client.async_put(
+        data=writable_td.select(*fields),
+        metadata=None,
+        partition_id=partition_id,
+    )
     cost = time.time() - t0
 
     if trace_payload is not None:
         trace_payload["worker_write_cost"] = cost
         output_meta_info = _attach_trace(output.meta_info, trace_key, trace_payload)
-        updated_meta.extra_info = _pack_extra_info(output_meta_info, output.non_tensor_batch)
+
+    updated_meta.extra_info = _pack_extra_info(output_meta_info, output.non_tensor_batch)
 
     _log_tq_conversion(
         direction="dataproto_to_batchmeta",

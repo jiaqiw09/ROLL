@@ -257,8 +257,6 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
         }
         return all_args, all_kwargs
 
-    from roll.utils.transferqueue_utils import NO_TQ_DISPATCH_TRACE_KEY, _attach_trace
-
     splitted_args, splitted_kwargs = _split_args_kwargs(cluster.dp_size, *args, **kwargs)
     all_args = []
 
@@ -466,17 +464,46 @@ def get_predefined_execute_fn(execute_mode):
 
 def func_generator(cls, method_name, dispatch_fn, collect_fn, execute_fn):
     def func(*args, blocking=True, **kwargs):
+        bench_timing_enabled = (
+            os.environ.get("ROLL_TRANSPORT_BENCHMARK_TIMING", "0") == "1" and method_name == "transport_benchmark"
+        )
+        driver_started_at = time.perf_counter() if bench_timing_enabled else None
+        dispatch_prepare_cost = submit_cost = driver_wait_cost = driver_collect_cost = None
+
         if method_name == "initialize":
             setattr(cls, "initialized", True)
 
+        dispatch_started_at = time.perf_counter() if bench_timing_enabled else None
         args, kwargs = dispatch_fn(cls, *args, **kwargs)
+        if bench_timing_enabled:
+            dispatch_prepare_cost = time.perf_counter() - dispatch_started_at
+
+        submit_started_at = time.perf_counter() if bench_timing_enabled else None
         output = execute_fn(method_name, *args, **kwargs)
+        if bench_timing_enabled:
+            submit_cost = time.perf_counter() - submit_started_at
         if blocking:
             timeout = None
             if "roll_RPC_TIMEOUT" in os.environ:
                 timeout = int(os.environ.get("roll_RPC_TIMEOUT"))
+            wait_started_at = time.perf_counter() if bench_timing_enabled else None
             output = ray.get(output, timeout=timeout)
+            if bench_timing_enabled:
+                driver_wait_cost = time.perf_counter() - wait_started_at
+        collect_started_at = time.perf_counter() if bench_timing_enabled else None
         output = collect_fn(cls, output)
+        if bench_timing_enabled:
+            driver_collect_cost = time.perf_counter() - collect_started_at
+            total_cost = time.perf_counter() - driver_started_at
+            mode = "tq" if _is_tq_enabled(cls) else "dataproto"
+            logger.info(
+                f"[BENCH driver timing] {method_name} | mode={mode} "
+                f"| dispatch_prepare={dispatch_prepare_cost:.3f}s "
+                f"| submit={submit_cost:.3f}s "
+                f"| wait={(driver_wait_cost or 0.0):.3f}s "
+                f"| collect={driver_collect_cost:.3f}s "
+                f"| total={total_cost:.3f}s"
+            )
         return output
 
     return func
