@@ -153,7 +153,7 @@ class PretrainedConfig:
                 setattr(self, name, getattr(args, name))
         self.bf16 = getattr(args, "bf16", self.bf16)
         self.fp16 = getattr(args, "fp16", self.fp16)
-
+        
     @classmethod
     def from_pretrained(cls, model_name_or_path: str, args: Optional["TrainingArguments"] = None):
         config_file = os.path.join(model_name_or_path, MCA_CONFIG_NAME)

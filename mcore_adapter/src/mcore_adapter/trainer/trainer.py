@@ -246,7 +246,7 @@ class McaTrainer(Trainer):
                 build_attention_mask=self.model_impl != "transformer_engine",
                 attn_mask_1D=attention_mask,
             )
-            if not self.model.config.num_moe_experts and self.model_impl == "transformer_engine":
+            if self.model_impl == "transformer_engine":
                 attention_mask = None
             inputs["attention_mask"] = attention_mask
 
@@ -257,8 +257,38 @@ class McaTrainer(Trainer):
         inputs = self._get_batch_on_this_cp_rank(inputs)
         return inputs
 
+    def _sync_runtime_config(self, inputs: dict[str, Tensor | Any]) -> None:
+        config = self.model.config
+        input_ids = inputs.get("input_ids")
+        if not isinstance(input_ids, Tensor):
+            return
+
+        batch_size, seq_length = input_ids.shape[:2]
+        config.micro_batch_size = batch_size
+        config.seq_length = seq_length
+
+        # MindSpeed's TE/NPU path expects these runtime fields to exist on the
+        # model config when it materializes a causal mask internally.
+        if not hasattr(config, "pre_tockens"):
+            config.pre_tockens = 65536
+        if not hasattr(config, "next_tockens"):
+            config.next_tockens = 0
+        if not hasattr(config, "attention_mask_type"):
+            config.attention_mask_type = "causal"
+        if not hasattr(config, "sparse_mode"):
+            config.sparse_mode = 0
+        if (
+            self.model_impl == "transformer_engine"
+            and hasattr(torch, "npu")
+            and torch.npu.is_available()
+        ):
+            # On MindSpeed's NPU TE path, causal attention expects the flash-attn
+            # branch so it can use the compressed [2048, 2048] mask shape.
+            config.use_flash_attn = True
+
     def _pre_compute_loss(self, data_iterator: Iterator, model: DistributedDataParallel):
         inputs = self._prepare_train_inputs(data_iterator)
+        self._sync_runtime_config(inputs)
         loss_mask = (inputs["labels"] != IGNORE_INDEX).float()
         if "loss_mask" not in inputs:
             inputs["loss_mask"] = loss_mask

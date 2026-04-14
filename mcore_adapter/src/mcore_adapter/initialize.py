@@ -12,7 +12,6 @@ from .utils import get_logger
 
 logger = get_logger(__name__)
 
-
 def is_distribute_initialized():
     return mpu.model_parallel_is_initialized()
 
@@ -39,7 +38,6 @@ def initialize_megatron(args: "TrainingArguments"):
     if not is_distribute_initialized():
         _initialize_distributed(args)
     _set_random_seed(args.seed)
-
 
 def _initialize_distributed(args: "TrainingArguments"):
     """Initialize torch.distributed and core model parallel."""
