@@ -18,6 +18,7 @@ from roll.pipeline.agentic.agentic_config import EnvManagerConfig
 from roll.utils.functionals import append_to_dict
 from roll.utils.import_utils import safe_import_class
 from roll.utils.logging import get_logger
+from roll.utils.transferqueue_utils import init_tq, dataproto_to_kv_batch_meta
 
 logger = get_logger()
 
@@ -219,6 +220,8 @@ class GroupQueue:
         async_generation_ratio,
         group_filter,
         env_monitor: Optional['EnvActivityMonitor'] = None,
+        tq_enabled: bool = False,
+        mode: str = "train",
     ):
         self.group_id = group_id
         self.progress_bar = progress_bar
@@ -230,6 +233,8 @@ class GroupQueue:
         self.group_filter = group_filter
         self.group_filter_count = 0
         self.env_monitor = env_monitor
+        self.tq_enabled = tq_enabled
+        self.mode = mode
 
         self.current_step = None
         self.next_episode_id = 0
@@ -322,7 +327,25 @@ class GroupQueue:
             return
         group = self.groups[episode_id]
         assert start_step >= group.create_step, f"{start_step=} {group.create_step=}"
-        group.rollouts.append(rollout)
+        
+        if self.tq_enabled and rollout is not None:
+            from roll.distributed.scheduler.protocol import LazyDataProto, log_dataflow
+            kv_meta = dataproto_to_kv_batch_meta(
+                rollout,
+                partition_id=self.mode,
+                tags=[{"group_id": self.group_id, "episode_id": episode_id}],
+            )
+            lazy_proto = LazyDataProto.from_kv_batch_meta(
+                kv_meta,
+                non_tensor_batch=rollout.non_tensor_batch,
+                meta_info=rollout.meta_info,
+            )
+            log_dataflow("rollout_scheduler.GroupQueue.put.lazy_created", lazy_proto, 
+                        group_id=self.group_id, episode_id=episode_id)
+            group.rollouts.append(lazy_proto)
+        else:
+            group.rollouts.append(rollout)
+        
         if len(group.rollouts) == self.group_size:
             if all(rollout is None for rollout in group.rollouts):
                 logger.info(f"GroupQueue: group {self.group_id} exit")
@@ -357,6 +380,7 @@ class GroupQueue:
 class GroupQueueManager:
     def __init__(self, config, env_manager_config: EnvManagerConfig, mode):
         self.mode = mode
+        self.config = config
         self.env_manager_config = env_manager_config
         self.group_size = self.env_manager_config.group_size
         self.progress_bar = tqdm(desc=f"{self.mode} rollout progress(total trajectory)", mininterval=self.env_manager_config.max_traj_per_env)
@@ -373,6 +397,13 @@ class GroupQueueManager:
         else:
             self.async_generation_ratio = 0
             self.max_traj_per_env = env_manager_config.max_traj_per_env if config.val_batch_size > 0 else None
+
+        self.tq_enabled = (
+            getattr(config, "transfer_queue", None) is not None
+            and config.transfer_queue.enable
+        )
+        if self.tq_enabled:
+            init_tq(config.transfer_queue)
 
         # Initialize env activity monitor first (before creating GroupQueues)
         self.group_queue: Dict[int, GroupQueue] = {}
@@ -395,6 +426,8 @@ class GroupQueueManager:
                         async_generation_ratio=self.async_generation_ratio,
                         group_filter=self.group_filter,
                         env_monitor=self.env_monitor,
+                        tq_enabled=self.tq_enabled,
+                        mode=self.mode,
                     )
 
         # Start monitoring after all GroupQueues are created
@@ -525,6 +558,11 @@ class GroupQueueManager:
                             continue
 
                         group_rollout = group_rollout[:self.group_size]
+                        if self.tq_enabled and group_rollout:
+                            from roll.distributed.scheduler.protocol import log_dataflow
+                            log_dataflow("rollout_scheduler.GroupQueueManager.get_batch.return", 
+                                        group_rollout[0] if len(group_rollout) == 1 else group_rollout[:2],
+                                        group_id=group.group_id, count=len(group_rollout))
                         ret.extend(group_rollout)
                         progress_bar.update(len(group_rollout))
 
@@ -594,6 +632,13 @@ class RolloutScheduler(RolloutMockMixin):
         )
 
         self.rollout_task = None
+
+        self.tq_enabled = (
+            getattr(config, "transfer_queue", None) is not None
+            and config.transfer_queue.enable
+        )
+        if self.tq_enabled:
+            init_tq(config.transfer_queue)
 
         # Initialize rollout mock mechanism from mixin
         self._init_rollout_mock()

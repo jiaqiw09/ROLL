@@ -2,8 +2,13 @@ from roll.utils.logging import get_logger
 
 logger = get_logger()
 
-from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
-from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
+try:
+    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
+    from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
+except ImportError:
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+    logger.warning("vllm does not have qwen3_5 config, using transformers config as fallback")
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
 
 def Qwen3_5TextConfig_init(
