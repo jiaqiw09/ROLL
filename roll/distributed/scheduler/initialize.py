@@ -31,6 +31,8 @@ def start_ray_cluster():
     master_port = get_driver_master_port()
     node_name = get_driver_node_name()
     dashboard_port = get_driver_dashboard_port()
+    object_store_memory = os.environ.get("ROLL_RAY_OBJECT_STORE_MEMORY_BYTES")
+    temp_dir = os.environ.get("ROLL_RAY_TEMP_DIR")
 
     if is_ray_cluster_running():
         logger.info("Ray cluster already initialized")
@@ -42,6 +44,11 @@ def start_ray_cluster():
         # fix: 处理大规模下可能会出现的head/worker node创建顺序不一致问题
         time.sleep(5)
         cmd = f"ray start --address={master_addr}:{master_port} --node-name={node_name} --dashboard-port={dashboard_port}"
+
+    if object_store_memory:
+        cmd += f" --object-store-memory={object_store_memory}"
+    if temp_dir:
+        cmd += f" --temp-dir={temp_dir}"
 
     logger.info(f"Starting ray cluster: {cmd}")
     ret = subprocess.run(cmd, shell=True, capture_output=True)
@@ -62,7 +69,10 @@ def init():
     manual_start = start_ray_cluster()
 
     runtime_env = {
-        "env_vars": current_platform.get_custom_env_vars(),
+        "env_vars": {
+            **current_platform.get_custom_env_vars(),
+            "TORCH_EXTENSIONS_DIR": os.environ.get("TORCH_EXTENSIONS_DIR", "/tmp/torch_extensions"),
+        },
     }
 
     if not ray.is_initialized():

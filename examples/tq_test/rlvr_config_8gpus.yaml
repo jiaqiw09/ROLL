@@ -3,7 +3,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "rlvr_precision_test_dump"
+exp_name: "qwen2.5-7B-rlvr-config"
 seed: 42
 logging_dir: ./output/logs
 output_dir: ./output
@@ -12,31 +12,32 @@ system_envs:
 
 checkpoint_config:
   type: file_system
-  output_dir: ./output/models/${exp_name}
+  output_dir: /data/cpfs_0/rl_examples/models/${exp_name}
+
+
+
 
 track_with: tensorboard
 tracker_kwargs:
-  log_dir: ./output/tensorboard
+  log_dir: /data/oss_bucket_0/rl_examples/llm/tensorboard/roll_exp/rlvr
 
 num_gpus_per_node: 8
 
-max_steps: 20
-save_steps: 10000
+max_steps: 500
+save_steps: 100
 logging_steps: 1
 eval_steps: 10
 resume_from_checkpoint: false
 
-# Rollout Mock Configuration - DUMP MODE
-rollout_mock:
-  enable: true
-  mode: dump
-  dump_dir: ./output/rollout_dumps/rlvr_baseline_v1
+async_pipeline: true
+async_generation_ratio: 2.0
+generate_opt_level: 1
 
 rollout_batch_size: 8  # prompt
 prompt_length: 2048
-response_length: 4096
+response_length: 2048
 
-num_return_sequences_in_group: 8
+num_return_sequences_in_group: 1
 ppo_epochs: 1
 adv_estimator: "reinforce"
 
@@ -67,22 +68,14 @@ add_token_level_kl: false
 # advantage
 whiten_advantages: true
 
-pretrain: Qwen/Qwen2.5-7B
-reward_pretrain: Qwen/Qwen2.5-7B
+# dynamic sampling scheduler
+# use_additional_prompts: true
+# max_running_requests: 256
+# is_num_return_sequences_expand: false
+global_template: qwen3
 
-validation:
-  data_args:
-    template: qwen2_5
-    file_name:
-      - data/math_benchmarks.jsonl
-  generating_args:
-    max_new_tokens: ${response_length}
-    top_p: 0.6
-    top_k: 50
-    num_beams: 1
-    temperature: 0.6
-    num_return_sequences: 1
-
+pretrain: /home/wjq/Qwen3-4B
+reward_pretrain: /home/wjq/Qwen3-4B
 
 actor_train:
   model_args:
@@ -93,14 +86,17 @@ actor_train:
     learning_rate: 1.0e-6
     weight_decay: 0
     per_device_train_batch_size: 1
-    gradient_accumulation_steps: 8
+    gradient_accumulation_steps: 1
+    warmup_steps: 20
     num_train_epochs: 50
   data_args:
-    template: qwen2_5
+    template: qwen3
     file_name:
       - data/math_deepmath_deal.jsonl
+      - data/general_ifeval_train_deal.jsonl
     domain_interleave_probs:
-      math_rule: 1
+      math_rule: 0.5
+      ifeval: 0.5
     dataset_dir: data
     messages: messages
     interleave_probs: "1.0"
@@ -108,13 +104,13 @@ actor_train:
   strategy_args:
     strategy_name: megatron_train
     strategy_config:
-      tensor_model_parallel_size: 1
-      pipeline_model_parallel_size: 1
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 2
       expert_model_parallel_size: 1
-      use_distributed_optimizer: true
+      use_distributed_optimizer: false
       recompute_granularity: full
-  device_mapping: list(range(0,8))
-  infer_batch_size: 1
+  device_mapping: list(range(8,12))
+  infer_batch_size: 4
 
 actor_infer:
   model_args:
@@ -128,14 +124,16 @@ actor_infer:
     temperature: 0.99
     num_return_sequences: ${num_return_sequences_in_group}
   data_args:
-    template: qwen2_5
+    template: qwen3
   strategy_args:
     strategy_name: vllm
     strategy_config:
+      tensor_parallel_size: 2
       gpu_memory_utilization: 0.8
       block_size: 16
       max_model_len: 8000
-  device_mapping: list(range(0,8))
+      load_format: auto
+  device_mapping: list(range(12,14))
   infer_batch_size: 1
 
 reference:
@@ -143,24 +141,40 @@ reference:
     disable_gradient_checkpointing: true
     dtype: bf16
     model_type: ~
+  system_envs:
+    NVTE_FLASH_ATTN: '0'
+    NVTE_FUSED_ATTN: '0'
+    NVTE_UNFUSED_ATTN: '1'
   data_args:
-    template: qwen2_5
+    template: qwen3
   strategy_args:
     strategy_name: megatron_infer
     strategy_config:
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-  device_mapping: list(range(0,8))
-  infer_batch_size: 1
+  device_mapping: list(range(14,15))
+  infer_batch_size: 2
 
 rewards:
+  ifeval:
+    worker_cls: roll.pipeline.rlvr.rewards.ifeval_rule_reward_worker.GeneralRuleRewardWorker
+    reward_type: soft
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    data_args:
+      template: qwen3
+    tag_included: [ifeval]
+    world_size: 1
+    device_mapping: list(range(15,16))
+    infer_batch_size: 4
   math_rule:
     worker_cls: roll.pipeline.rlvr.rewards.math_rule_reward_worker.MathRuleRewardWorker
     model_args:
       model_name_or_path: ${reward_pretrain}
     data_args:
-      template: qwen2_5
+      template: qwen3
     tag_included: [deepmath_103k, aime]
-    world_size: 8
+    world_size: 1
+    device_mapping: list(range(15,16))
     infer_batch_size: 1

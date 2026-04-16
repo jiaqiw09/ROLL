@@ -836,9 +836,11 @@ class DataProto:
         DataProto
             The concatenated DataProto instance.
         """
-        # Normalize input to List[<reference>]
+        # TQ collect may already have materialized the merged result on the driver.
         if isinstance(data_refs, DataProto):
-            data_refs = [data_refs]
+            return data_refs
+        if isinstance(data_refs, list) and data_refs and isinstance(data_refs[0], DataProto):
+            return DataProto.concat(data_refs, global_keys=global_keys)
 
         timeout = None
         if "roll_RPC_TIMEOUT" in os.environ:

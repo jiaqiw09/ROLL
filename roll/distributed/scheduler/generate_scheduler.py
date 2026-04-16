@@ -22,6 +22,7 @@ from roll.distributed.scheduler.protocol import DataProto, pad_dataproto_to_divi
 from roll.distributed.scheduler.reward_scheduler import RewardScheduler
 from roll.distributed.scheduler.rollout_mock_mixin import RolloutMockMixin
 from roll.models.model_providers import default_tokenizer_provider, default_processor_provider
+from roll.utils.context_managers import cpu_memory_info
 from roll.utils.taskgroups import TaskGroup # TODO use official TaskGroup after upgrade to python 3.11
 from roll.utils.metrics.metrics_manager import DurationTracker
 from roll.utils.import_utils import safe_import_class
@@ -29,6 +30,28 @@ from roll.utils.logging import get_logger
 
 
 logger = get_logger()
+TQ_SCHEDULER_RETURN_PARTITION_ID = "train_scheduler_return"
+TQ_REPLAY_PARTITION_ID = "train_replay"
+
+
+def _calc_tensordict_size_mb(td) -> float:
+    total = 0
+    if td is None:
+        return 0.0
+    for value in td.values():
+        if hasattr(value, "nbytes"):
+            total += value.nbytes
+    return total / (1024 * 1024)
+
+
+def _calc_dataproto_size_mb(data: Optional[DataProto]) -> float:
+    if data is None:
+        return 0.0
+    return _calc_tensordict_size_mb(data.batch)
+
+
+def _get_process_rss_gb() -> float:
+    return cpu_memory_info().rss / 1024**3
 
 
 def expand_requests(data: DataProto, num_return_sequences, is_num_return_sequences_expand):
@@ -514,6 +537,14 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         self.reward_scheduler = RewardScheduler()
 
     async def initialize(self):
+        # Initialize TransferQueue if enabled (must be done in each Ray Actor process)
+        tq_conf = getattr(self.pipeline_config, "transfer_queue", None)
+        if tq_conf is not None and getattr(tq_conf, "enable", False):
+            from roll.utils.transferqueue_utils import init_tq
+            import dataclasses
+            init_tq(dataclasses.asdict(tq_conf))
+            logger.info("TransferQueue initialized in DynamicSamplingScheduler")
+
         await self.router_manager.initialize()
         self.router_client = await RouterManager.create_client(self.router_manager)
 
@@ -602,7 +633,13 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         }
         return batch
 
-    async def get_batch(self, data: DataProto, global_step: int, batch_size: int) -> DataProto:
+    async def get_batch(
+        self,
+        data: DataProto,
+        global_step: int,
+        batch_size: int,
+        return_batch_meta: bool = False,
+    ) -> DataProto:
         # MOCK MODE: Load pre-recorded data, skip rollout (from mixin)
         if self._should_load_mock(global_step):
             return await self._load_mock_batch(global_step)
@@ -668,14 +705,48 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         # DUMP MODE: Save merged batch (from mixin)
         await self._maybe_dump_batch(batch, global_step)
 
+        tq_conf = getattr(self.pipeline_config, "transfer_queue", None)
+        use_tq = tq_conf is not None and getattr(tq_conf, "enable", False)
+        if return_batch_meta and use_tq:
+            import transfer_queue as tq_mod
+
+            from roll.utils.transferqueue_utils import _pack_extra_info
+
+            tq_client = tq_mod.get_client()
+            batch_meta = await tq_client.async_put(
+                data=batch.batch,
+                metadata=None,
+                partition_id=TQ_SCHEDULER_RETURN_PARTITION_ID,
+            )
+            batch_meta.extra_info = _pack_extra_info(batch.meta_info, batch.non_tensor_batch)
+            return batch_meta
+
         return batch
 
     def collect_items_as_batch(self, finished_items: List[ExperienceItem]) -> DataProto:
         collect_data_by_domain = defaultdict(list)
         data_off_policy_step = 0.0
         prompt_ids = set()
+
+        # ------ TQ: resolve BatchMeta → DataProto if TQ is enabled ------
+        tq_conf = getattr(self.pipeline_config, "transfer_queue", None)
+        use_tq = tq_conf is not None and getattr(tq_conf, "enable", False)
+        if use_tq:
+            try:
+                from transfer_queue import BatchMeta as _BatchMeta
+                from roll.utils.transferqueue_utils import _meta_to_dataproto
+                _has_batchmeta = True
+            except ImportError:
+                _has_batchmeta = False
+        else:
+            _has_batchmeta = False
+        # -----------------------------------------------------------------
+
         for item in finished_items:
-            collect_data_by_domain[item.domain].append(item.data)
+            data = item.data
+            if _has_batchmeta and isinstance(data, _BatchMeta):
+                data = _meta_to_dataproto(data)
+            collect_data_by_domain[item.domain].append(data)
             data_off_policy_step += self.replay_buffer.current_step - item.sampling_start_step
             prompt_ids.add(item.prompt_id)
         data_off_policy_step = data_off_policy_step / len(finished_items)
@@ -783,6 +854,68 @@ class RolloutContext:
                 scheduler.replay_buffer.abort(prompt_id)
             else:
                 assert context.sampling_start_step is not None
+
+                # ------ TQ: store BatchMeta instead of DataProto in ReplayBuffer ------
+                tq_conf = getattr(scheduler.pipeline_config, "transfer_queue", None)
+                use_tq = tq_conf is not None and getattr(tq_conf, "enable", False)
+                if use_tq:
+                    from roll.utils.transferqueue_utils import (
+                        _run_async_in_temp_loop, _pack_extra_info,
+                    )
+                    import transfer_queue as tq_mod
+                    tq_client = tq_mod.get_client()
+                    import time
+
+                    def _store_response_in_tq(response: DataProto):
+                        async def _put(resp):
+                            if resp.batch is None or len(resp.batch.batch_size) == 0 or resp.batch.batch_size[0] == 0:
+                                return None
+                            data_mb = sum(
+                                v.nbytes for v in resp.batch.values() if hasattr(v, 'nbytes')
+                            ) / (1024 * 1024)
+                            n_rows = resp.batch.batch_size[0]
+                            logger.info(
+                                f"[TQ replay] WRITE TRIGGERED | prompt_id={prompt_id} "
+                                f"| rows={n_rows} | data={data_mb:.2f}MB "
+                                f"(saved from in-process ReplayBuffer memory)"
+                            )
+                            t0 = time.time()
+                            meta = await tq_client.async_put(
+                                data=resp.batch,
+                                metadata=None,
+                                partition_id=TQ_REPLAY_PARTITION_ID,
+                            )
+                            meta.extra_info = _pack_extra_info(resp.meta_info, resp.non_tensor_batch)
+                            write_cost = time.time() - t0
+                            logger.info(
+                                f"[TQ replay] WRITE DONE | prompt_id={prompt_id} "
+                                f"| rows={n_rows} | data={data_mb:.2f}MB "
+                                f"| TQ write cost={write_cost:.3f}s | rss={_get_process_rss_gb():.3f}GB"
+                            )
+                            return meta
+                        return _run_async_in_temp_loop(_put, response)
+
+                    committed_responses = []
+                    for response in responses:
+                        batch_meta = _store_response_in_tq(response)
+                        committed_responses.append(
+                            batch_meta if batch_meta is not None else response
+                        )
+                    responses = committed_responses
+                else:
+                    total_data_mb = sum(_calc_dataproto_size_mb(response) for response in responses)
+                    total_rows = sum(
+                        response.batch.batch_size[0]
+                        for response in responses
+                        if response.batch is not None
+                    )
+                    logger.info(
+                        f"[NO TQ replay] STASH IN REPLAY BUFFER | prompt_id={prompt_id} "
+                        f"| responses={len(responses)} | rows={total_rows} | data={total_data_mb:.2f}MB "
+                        f"| rss={_get_process_rss_gb():.3f}GB"
+                    )
+                # -----------------------------------------------------------------------
+
                 scheduler.replay_buffer.commit(
                     prompt_id,
                     [
