@@ -23,7 +23,7 @@ from roll.distributed.executor.cluster import Cluster
 from roll.configs.base_config import RouterArguments
 from roll.distributed.scheduler.generate_scheduler import DynamicSamplingScheduler
 from roll.distributed.scheduler.router import RouterManager
-from roll.distributed.scheduler.protocol import DataProto
+from roll.distributed.scheduler.protocol import BatchData, DataProto, log_dataflow
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.utils.constants import RAY_NAMESPACE
@@ -55,8 +55,6 @@ def is_lora_training(pipeline_config: RLVRConfig) -> bool:
 
 
 def preprocess_dataset(dataset, prompt_len, encode_function, data_args):
-    # 处理数据
-    print(f"Begin : {dataset}")
     dataset = dataset.map(
         encode_function,
         batched=True,
@@ -64,14 +62,11 @@ def preprocess_dataset(dataset, prompt_len, encode_function, data_args):
         desc="Encoding dataset",
         load_from_cache_file=False,
     )
-    # 过滤cutoff
     dataset = dataset.filter(
         lambda data_i: 5 < len(data_i["input_ids"]) <= prompt_len,
         num_proc=data_args.preprocessing_num_workers,
         desc="Filtering dataset",
     )
-    print(f"Filtering prompt len: {dataset}")
-    print(f"Encoding: {dataset}")
     return dataset
 
 
@@ -114,7 +109,8 @@ class RLVRPipeline(BasePipeline):
         if self.pipeline_config.actor_train.data_args.file_name:
             dataset_paths.extend(self.pipeline_config.actor_train.data_args.file_name)
 
-        print(f"load_dataset_paths: {chr(10)} {chr(10).join(dataset_paths)}")
+        if dataset_paths:
+            logger.info(f"loading datasets: {dataset_paths}")
         dataset = get_dataset(self.pipeline_config.actor_train.data_args)
 
         self.val_dataset = None
@@ -167,7 +163,9 @@ class RLVRPipeline(BasePipeline):
             assert "domain" in self.val_dataset.column_names, "domain field should set in val dataset"
 
         assert "domain" in dataset.column_names, "domain field should set in dataset"
-        print(dataset)
+        logger.info(
+            f"train dataset prepared: size={len(dataset)}, domains={list(self.domain_datasets.keys())}"
+        )
 
         self.kl_ctrl = get_kl_controller(
             init_kl_coef=self.pipeline_config.init_kl_coef,
@@ -460,8 +458,6 @@ class RLVRPipeline(BasePipeline):
 
             metrics_mgr.clear_metrics()
             with tps_timer, Timer(name="step_total", logger=None) as step_total_timer:
-                # if global_step > self.state.step + 1:
-                logger.info(f"pre_step_total_time: {pre_step_total_time}")
                 metrics_mgr.add_metric("time/step_total", pre_step_total_time)
                 batch: DataProto = DataProto(
                     meta_info={
@@ -518,7 +514,8 @@ class RLVRPipeline(BasePipeline):
                             domain, reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         )
                         domain_batches[domain] = domain_batch
-                    generate_output = DataProto.concat([domain_batch for domain_batch in domain_batches.values()])
+                    generate_output = BatchData([domain_batch for domain_batch in domain_batches.values()]).concat()
+                    log_dataflow("rlvr.proto_path.after_generate_concat", generate_output, global_step=global_step)
                     dump_rollout_to_specific_path(self.pipeline_config.rollout_dump_dir, global_step, generate_output, self.tokenizer)
                     generate_output.meta_info.pop("is_offload_states", None)
 
@@ -532,6 +529,7 @@ class RLVRPipeline(BasePipeline):
                 metrics_mgr.add_metric("time/step_generate", step_generate_timer.last)
 
                 batch = generate_output
+                log_dataflow("rlvr.proto_path.before_compute", batch, global_step=global_step)
                 batch.meta_info["global_step"] = global_step
                 batch.meta_info["_broadcast_non_tensor_batch"] = True
                 batch.meta_info["loss_mask_keys"] = ['response_mask', 'final_response_mask']
@@ -571,7 +569,12 @@ class RLVRPipeline(BasePipeline):
                         batch.meta_info["disable_adapter"] = False
                     batch.meta_info["is_offload_states"] = False
                     if self.pipeline_config.adv_estimator == "gae":
+                        values_submit_start = time.perf_counter()
                         values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
+                        metrics_mgr.add_metric(
+                            "time/controller/critic/compute_values/submit",
+                            time.perf_counter() - values_submit_start,
+                        )
 
                     if self.pipeline_config.enable_old_logprobs_recompute:
                         batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
@@ -586,15 +589,24 @@ class RLVRPipeline(BasePipeline):
                                 "actor_train/compute_log_probs",
                             )
                             metrics_mgr.add_metrics(dynamic_batching_metrics)
+                        old_log_probs_submit_start = time.perf_counter()
                         old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
-                        old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                        metrics_mgr.add_metric(
+                            "time/controller/actor_train/compute_log_probs/submit",
+                            time.perf_counter() - old_log_probs_submit_start,
+                        )
+                        old_log_probs = BatchData(old_log_probs_refs).concat(
+                            metric_prefix="actor_train/compute_log_probs"
+                        )
 
                         # Customize_logging metrics, Double check call twice
                         if self.pipeline_config.save_logging_board_dir:
                             old_log_probs_refs2: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
                                 batch, blocking=False
                             )
-                            old_log_probs2 = DataProto.materialize_concat(data_refs=old_log_probs_refs2)
+                            old_log_probs2 = BatchData(old_log_probs_refs2).concat(
+                                metric_prefix="actor_train/compute_log_probs_logging_board"
+                            )
                             batch.batch["old_log_probs2"] = old_log_probs2.batch["log_probs"]
                             batch.batch["old_log_probs2_entropy"] = old_log_probs2.batch["entropy"]
 
@@ -612,7 +624,7 @@ class RLVRPipeline(BasePipeline):
                         batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
 
                     if self.pipeline_config.adv_estimator == "gae":
-                        values = DataProto.materialize_concat(data_refs=values_refs)
+                        values = BatchData(values_refs).concat(metric_prefix="critic/compute_values")
                         batch = batch.union(values)
                         metrics_mgr.add_reduced_metrics(values.meta_info.pop("metrics", {}))
 
@@ -669,7 +681,8 @@ class RLVRPipeline(BasePipeline):
                     if self.pipeline_config.save_logging_board_dir:
                         self.save_metrics(domain_batch)
 
-                batch = DataProto.concat(batch_list)
+                batch = BatchData(batch_list).concat()
+                log_dataflow("rlvr.proto_path.after_reward_concat", batch, global_step=global_step)
 
                 if batch.batch["final_response_mask"].sum() == 0:
                     logger.info("Warning: final_response_mask.sum() == 0! Current step will be skipped.")
@@ -707,7 +720,12 @@ class RLVRPipeline(BasePipeline):
 
                 with Timer(name="step_train", logger=None) as step_train_timer:
                     if self.pipeline_config.adv_estimator == "gae":
+                        critic_train_submit_start = time.perf_counter()
                         critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
+                        metrics_mgr.add_metric(
+                            "time/controller/critic/train_step/submit",
+                            time.perf_counter() - critic_train_submit_start,
+                        )
 
                     with actor_train_timer:
                         # implement critic warmup
@@ -730,14 +748,23 @@ class RLVRPipeline(BasePipeline):
                                     "actor_train/train_step",
                                 )
                                 metrics_mgr.add_metrics(dynamic_batching_metrics)
+                            actor_train_submit_start = time.perf_counter()
                             actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
-                            actor_train_metrics: DataProto = DataProto.materialize_concat(
-                                data_refs=actor_train_metrics_refs
+                            metrics_mgr.add_metric(
+                                "time/controller/actor_train/train_step/submit",
+                                time.perf_counter() - actor_train_submit_start,
                             )
+                            actor_train_metrics: DataProto = BatchData(actor_train_metrics_refs).concat(
+                                metric_prefix="actor_train/train_step"
+                            )
+                            log_dataflow("rlvr.after_actor_train_step_concat", actor_train_metrics, global_step=global_step)
                             metrics_mgr.add_reduced_metrics(actor_train_metrics.meta_info.pop("metrics", {}))
 
                     if self.pipeline_config.adv_estimator == "gae":
-                        critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
+                        critic_train_metrics = BatchData(critic_train_metrics_refs).concat(
+                            metric_prefix="critic/train_step"
+                        )
+                        log_dataflow("rlvr.after_critic_train_step_concat", critic_train_metrics, global_step=global_step)
                         metrics_mgr.add_reduced_metrics(critic_train_metrics.meta_info.pop("metrics", {}))
 
                 metrics_mgr.add_metric("time/step_train", step_train_timer.last)

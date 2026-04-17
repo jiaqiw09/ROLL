@@ -41,6 +41,7 @@ tracker_kwargs:
 
 checkpoint_config:
   type: file_system
+  output_dir: ./output/checkpoints/${exp_name}
 
 num_gpus_per_node: 8
 
@@ -63,8 +64,8 @@ whiten_advantages: true
 entropy_loss_coef: 0
 max_grad_norm: 1.0
 
-pretrain: Qwen/Qwen3-30B-A3B
-reward_pretrain: Qwen/Qwen3-30B-A3B
+pretrain: "/home/wjq/Qwen3-4B"
+reward_pretrain: "/home/wjq/Qwen3-4B"
 
 actor_train:
   model_args:
@@ -102,7 +103,7 @@ actor_train:
           - Qwen3MoeAttention
           - Qwen3MoeSparseMoeBlock
   use_remove_padding: true
-  device_mapping: list(range(0,32))
+  device_mapping: list(range(8,10))
   infer_batch_size: 1
 
 actor_infer:
@@ -122,8 +123,8 @@ actor_infer:
       gpu_memory_utilization: 0.7
       block_size: 16
       load_format: auto
-      tensor_parallel_size: 4
-  device_mapping: list(range(0,32))
+      tensor_parallel_size: 2
+  device_mapping: list(range(10,12))
 
 reference:
   model_args:
@@ -144,7 +145,7 @@ reference:
       tiled_num_shards: 8
       reshard_after_forward: true
       offload_policy: true
-  device_mapping: list(range(0,32))
+  device_mapping: list(range(12,14))
   infer_batch_size: 1
 
 reward_normalization:
@@ -182,3 +183,13 @@ custom_envs:
     ${custom_env.FrozenLake}
   FrozenLakeThink:
     ${custom_env.FrozenLakeThink}
+
+
+
+transfer_queue:
+  enable: true
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      total_storage_size: 100000
+      num_data_storage_units: 8
